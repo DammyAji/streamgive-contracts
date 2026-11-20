@@ -89,6 +89,19 @@ pub struct TransferStreamEvent {
     pub settled: i128,
 }
 
+#[contractevent(topics = ["strmpause"], data_format = "vec")]
+pub struct PausedStreamEvent {
+    #[topic]
+    pub stream_id: u64,
+    pub settled: i128,
+}
+
+#[contractevent(topics = ["strmresume"], data_format = "vec")]
+pub struct ResumedStreamEvent {
+    #[topic]
+    pub stream_id: u64,
+}
+
 #[contractevent(topics = ["treasset"], data_format = "single-value")]
 pub struct TreasurySetEvent {
     pub treasury: Address,
@@ -226,6 +239,9 @@ pub enum StreamStatus {
     /// The stream ran to completion: the last withdrawal brought balance
     /// to zero without a cancel.
     Drained,
+    /// Donor-paused. The rate and balance are retained, but elapsed time
+    /// does not accrue until the donor resumes the stream.
+    Paused,
 }
 
 /// All admin configuration and global contract parameters returned by `get_config`.
@@ -240,6 +256,8 @@ pub struct Config {
     pub registry: Option<Address>,
     pub cancel_grace_ledgers: u32,
     pub total_donated: i128,
+    pub total_withdrawn: i128,
+    pub total_fees_collected: i128,
     pub pending_admin: Option<Address>,
     pub renounced: bool,
 }
@@ -272,6 +290,12 @@ pub enum DataKey {
     TokenFeeBps(Address),
     /// Lifetime sum of successful stream deposits and top-ups.
     TotalDonated,
+    /// Lifetime gross amount settled and paid out to NGOs.
+    TotalWithdrawn,
+    /// Lifetime protocol fees collected and sent to the treasury.
+    TotalFeesCollected,
+    /// Stream ids currently associated with an NGO.
+    NgoStreams(Address),
     /// The token allowlist surfaced to frontend token pickers. See
     /// [`allowed_tokens`](DonationVault::allowed_tokens); empty until an
     /// operator configures one.
@@ -359,6 +383,12 @@ pub enum Error {
     BatchLimitExceeded = 24,
     /// `withdraw_batch` was called with duplicate stream IDs.
     DuplicateStreamId = 25,
+    /// The stream is already paused.
+    StreamAlreadyPaused = 26,
+    /// The stream is not paused.
+    StreamNotPaused = 27,
+    /// A paused stream cannot be withdrawn until it is resumed.
+    StreamPaused = 28,
     /// `create_stream` was given the vault's own address as the NGO. Nobody
     /// can authorise as the vault, so the stream could never be withdrawn.
     InvalidNgo = 26,
@@ -377,6 +407,9 @@ pub const MAX_BATCH_GET_STREAMS: u32 = 40;
 /// Maximum number of streams that can be withdrawn in a single `withdraw_batch` call.
 /// Chosen to stay well within Soroban's per-transaction CPU and footprint budget.
 pub const MAX_BATCH_WITHDRAW_STREAMS: u32 = 20;
+
+/// Maximum number of NGO stream ids returned by `streams_by_ngo` in one page.
+pub const MAX_STREAMS_BY_NGO: u32 = 100;
 
 const MAX_FEE_BPS: u32 = 1_000;
 
@@ -578,14 +611,48 @@ fn pay_ngo(env: &Env, token_client: &token::Client, ngo: &Address, amount: i128)
     net
 }
 
+fn record_outflow_totals(env: &Env, gross: i128, fee: i128) -> Result<(), Error> {
+    if gross > 0 {
+        let withdrawn: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalWithdrawn)
+            .unwrap_or(0);
+        let next = withdrawn
+            .checked_add(gross)
+            .ok_or(Error::ArithmeticOverflow)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalWithdrawn, &next);
+    }
+    if fee > 0 {
+        let collected: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalFeesCollected)
+            .unwrap_or(0);
+        let next = collected
+            .checked_add(fee)
+            .ok_or(Error::ArithmeticOverflow)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalFeesCollected, &next);
+    }
+    Ok(())
+}
+
 /// Settles the accrual accumulated since the stream's last checkpoint.
 ///
 /// This is shared by every operation that changes a stream's balance or rate
 /// so payout accounting, checked arithmetic, and the checkpoint timestamp
 /// cannot drift between entry points.
 fn settle(env: &Env, stream: &mut Stream, now: u64) -> Result<i128, Error> {
-    let elapsed = now.saturating_sub(stream.last_update);
-    let accrued = math::accrued(stream.rate, elapsed, stream.balance);
+    let accrued = if stream.status == StreamStatus::Paused {
+        0
+    } else {
+        let elapsed = now.saturating_sub(stream.last_update);
+        math::accrued(stream.rate, elapsed, stream.balance)
+    };
 
     if accrued > 0 {
         // Update stream state before the external token transfer
@@ -601,6 +668,8 @@ fn settle(env: &Env, stream: &mut Stream, now: u64) -> Result<i128, Error> {
     // External token transfer is the last step
     if accrued > 0 {
         let token_client = token::Client::new(env, &stream.token);
+        let fee = compute_fee(env, &stream.token, accrued);
+        record_outflow_totals(env, accrued, fee)?;
         pay_ngo(env, &token_client, &stream.ngo, accrued);
     }
 
@@ -618,6 +687,12 @@ impl DonationVault {
         env.storage().instance().set(&DataKey::NextStreamId, &0u64);
         env.storage().instance().set(&DataKey::MinDeposit, &0i128);
         env.storage().instance().set(&DataKey::TotalDonated, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalWithdrawn, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalFeesCollected, &0i128);
         env.storage()
             .instance()
             .set(&DataKey::CancelGraceLedgers, &0u32);
@@ -652,6 +727,12 @@ impl DonationVault {
         env.storage().instance().set(&DataKey::NextStreamId, &0u64);
         env.storage().instance().set(&DataKey::MinDeposit, &0i128);
         env.storage().instance().set(&DataKey::TotalDonated, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalWithdrawn, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalFeesCollected, &0i128);
         env.storage()
             .instance()
             .set(&DataKey::CancelGraceLedgers, &0u32);
@@ -704,6 +785,22 @@ impl DonationVault {
         env.storage()
             .instance()
             .get(&DataKey::TotalDonated)
+            .unwrap_or(0)
+    }
+
+    /// Returns the cumulative gross amount settled and paid out from streams.
+    pub fn total_withdrawn(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalWithdrawn)
+            .unwrap_or(0)
+    }
+
+    /// Returns the cumulative protocol fees sent to the treasury.
+    pub fn total_fees_collected(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalFeesCollected)
             .unwrap_or(0)
     }
 
@@ -967,6 +1064,28 @@ impl DonationVault {
                 if stream.donor == donor {
                     ids.push_back(id);
                 }
+            }
+        }
+        ids
+    }
+
+    /// Lists stream ids associated with an NGO in creation order.
+    /// Results are bounded by `limit`, which is clamped to `MAX_STREAMS_BY_NGO`.
+    pub fn streams_by_ngo(env: Env, ngo: Address, start: u32, limit: u32) -> Vec<u64> {
+        let ngo_streams: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NgoStreams(ngo))
+            .unwrap_or_else(|| Vec::new(&env));
+        let capped = limit.min(MAX_STREAMS_BY_NGO);
+        let mut ids = Vec::new(&env);
+        if start >= ngo_streams.len() {
+            return ids;
+        }
+        let end = (start as u32).saturating_add(capped).min(ngo_streams.len());
+        for i in start..end {
+            if let Some(id) = ngo_streams.get(i) {
+                ids.push_back(id);
             }
         }
         ids
@@ -1263,8 +1382,8 @@ impl DonationVault {
 
     /// Reads back all admin-set configuration and contract state parameters in one call:
     /// `paused`, `treasury`, `fee_bps`, `min_deposit`, `max_streams_per_donor`,
-    /// `registry`, `cancel_grace_ledgers`, `total_donated`, `pending_admin`, and
-    /// `renounced`.
+    /// `registry`, `cancel_grace_ledgers`, `total_donated`, `total_withdrawn`,
+    /// `total_fees_collected`, `pending_admin`, and `renounced`.
     pub fn get_config(env: Env) -> Config {
         Config {
             paused: env
@@ -1294,6 +1413,16 @@ impl DonationVault {
                 .storage()
                 .instance()
                 .get(&DataKey::TotalDonated)
+                .unwrap_or(0),
+            total_withdrawn: env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalWithdrawn)
+                .unwrap_or(0),
+            total_fees_collected: env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalFeesCollected)
                 .unwrap_or(0),
             pending_admin: env.storage().instance().get(&DataKey::PendingAdmin),
             renounced: env
@@ -1926,6 +2055,19 @@ impl DonationVault {
         env.storage()
             .persistent()
             .set(&DataKey::Stream(stream_id), &stream);
+        let ngo_key = DataKey::NgoStreams(ngo.clone());
+        let mut ngo_streams: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&ngo_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        ngo_streams.push_back(stream_id);
+        env.storage().persistent().set(&ngo_key, &ngo_streams);
+        env.storage().persistent().extend_ttl(
+            &ngo_key,
+            STREAM_LIFETIME_THRESHOLD,
+            STREAM_BUMP_AMOUNT,
+        );
         let next_stream_id = stream_id.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
         env.storage()
             .instance()
@@ -1964,6 +2106,74 @@ impl DonationVault {
         .publish(&env);
 
         Ok(stream_id)
+    }
+
+    /// Pauses a stream after settling all accrued funds. The balance and rate
+    /// are retained, while the stream no longer accrues until resumed.
+    pub fn pause_stream(env: Env, stream_id: u64) -> Result<i128, Error> {
+        require_not_paused(&env)?;
+        let key = DataKey::Stream(stream_id);
+        let mut stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::StreamNotFound)?;
+
+        stream.donor.require_auth();
+        if stream.cancelled {
+            return Err(Error::StreamCancelled);
+        }
+        if stream.status == StreamStatus::Paused {
+            return Err(Error::StreamAlreadyPaused);
+        }
+        if stream.status == StreamStatus::Drained {
+            return Err(Error::StreamCancelled);
+        }
+        if stream.balance == 0 {
+            return Err(Error::StreamCancelled);
+        }
+
+        let now = env.ledger().timestamp();
+        let settled = settle(&env, &mut stream, now)?;
+        if stream.balance == 0 {
+            stream.status = StreamStatus::Drained;
+        } else {
+            stream.status = StreamStatus::Paused;
+        }
+        env.storage().persistent().set(&key, &stream);
+        extend_instance_ttl(&env);
+        extend_stream_ttl(&env, stream_id);
+
+        PausedStreamEvent { stream_id, settled }.publish(&env);
+        Ok(settled)
+    }
+
+    /// Resumes a paused stream. No time elapsed while paused is added to accrual.
+    pub fn resume_stream(env: Env, stream_id: u64) -> Result<(), Error> {
+        require_not_paused(&env)?;
+        let key = DataKey::Stream(stream_id);
+        let mut stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::StreamNotFound)?;
+
+        stream.donor.require_auth();
+        if stream.cancelled {
+            return Err(Error::StreamCancelled);
+        }
+        if stream.status != StreamStatus::Paused {
+            return Err(Error::StreamNotPaused);
+        }
+
+        stream.status = StreamStatus::Active;
+        stream.last_update = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &stream);
+        extend_instance_ttl(&env);
+        extend_stream_ttl(&env, stream_id);
+
+        ResumedStreamEvent { stream_id }.publish(&env);
+        Ok(())
     }
 
     /// Pays out everything accrued to the NGO since the last checkpoint.
@@ -2013,6 +2223,10 @@ impl DonationVault {
             .ok_or(Error::StreamNotFound)?;
 
         stream.ngo.require_auth();
+
+        if stream.status == StreamStatus::Paused {
+            return Err(Error::StreamPaused);
+        }
 
         let now = env.ledger().timestamp();
         let elapsed = now.saturating_sub(stream.last_update);
@@ -2129,6 +2343,10 @@ impl DonationVault {
                 .get(&key)
                 .ok_or(Error::StreamNotFound)?;
 
+            if stream.status == StreamStatus::Paused {
+                return Err(Error::StreamPaused);
+            }
+
             // Every stream in a batch has to share one NGO: the payouts are
             // summed per token and sent to a single address, so a batch that
             // mixed NGOs would silently pay the first one for the others'
@@ -2195,6 +2413,14 @@ impl DonationVault {
         if total_accrued <= 0 {
             return Err(Error::NothingToWithdraw);
         }
+
+        let mut total_fees: i128 = 0;
+        for (_, fee) in fee_payouts.iter() {
+            total_fees = total_fees
+                .checked_add(fee)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+        record_outflow_totals(&env, total_accrued, total_fees)?;
 
         if let Some(ngo) = ngo {
             extend_instance_ttl(&env);
@@ -2664,6 +2890,30 @@ impl DonationVault {
         stream.ngo = new_ngo.clone();
 
         env.storage().persistent().set(&key, &stream);
+
+        let old_key = DataKey::NgoStreams(old_ngo.clone());
+        if let Some(mut old_streams) = env.storage().persistent().get::<_, Vec<u64>>(&old_key) {
+            let mut remaining = Vec::new(&env);
+            for id in old_streams.iter() {
+                if id != stream_id {
+                    remaining.push_back(id);
+                }
+            }
+            env.storage().persistent().set(&old_key, &remaining);
+        }
+        let new_key = DataKey::NgoStreams(new_ngo.clone());
+        let mut new_streams: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&new_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        new_streams.push_back(stream_id);
+        env.storage().persistent().set(&new_key, &new_streams);
+        env.storage().persistent().extend_ttl(
+            &new_key,
+            STREAM_LIFETIME_THRESHOLD,
+            STREAM_BUMP_AMOUNT,
+        );
         extend_instance_ttl(&env);
         extend_stream_ttl(&env, stream_id);
 

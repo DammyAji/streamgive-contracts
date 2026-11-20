@@ -1021,6 +1021,8 @@ fn get_config_reflects_admin_settings() {
             registry: None,
             cancel_grace_ledgers: 0,
             total_donated: 0,
+            total_withdrawn: 0,
+            total_fees_collected: 0,
             pending_admin: None,
             renounced: false,
         }
@@ -1047,6 +1049,8 @@ fn get_config_reflects_admin_settings() {
             registry: None, // configured after the stream operations below
             cancel_grace_ledgers: 10,
             total_donated: 0,
+            total_withdrawn: 0,
+            total_fees_collected: 0,
             pending_admin: None,
             renounced: false,
         }
@@ -3334,6 +3338,73 @@ fn total_donated_counts_create_and_top_up() {
 
     s.client.top_up(&stream_id, &500);
     assert_eq!(s.client.total_donated(), 1_500);
+}
+
+#[test]
+fn pause_resume_top_up_cancel_and_outflow_totals() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    assert_eq!(s.client.pause_stream(&stream_id), 100);
+    let paused = s.client.get_stream(&stream_id);
+    assert_eq!(paused.status, StreamStatus::Paused);
+    assert_eq!(paused.balance, 900);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+    s.client.top_up(&stream_id, &500);
+    let topped_up = s.client.get_stream(&stream_id);
+    assert_eq!(topped_up.status, StreamStatus::Paused);
+    assert_eq!(topped_up.balance, 1_400);
+    assert_eq!(s.client.total_withdrawn(), 100);
+
+    s.client.resume_stream(&stream_id);
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Active);
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    assert_eq!(s.client.withdraw(&stream_id), 100);
+    assert_eq!(s.client.total_withdrawn(), 200);
+
+    s.client.cancel_stream(&stream_id);
+    let config = s.client.get_config();
+    assert_eq!(config.total_withdrawn, 200);
+    assert_eq!(config.total_fees_collected, 100);
+}
+
+#[test]
+fn streams_by_ngo_tracks_create_and_transfer_with_pagination() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+    let other_ngo = Address::generate(&s.env);
+
+    let first = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let second = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &500, &10);
+
+    assert_eq!(s.client.streams_by_ngo(&s.ngo, &0, &1).len(), 1);
+    assert_eq!(
+        s.client.streams_by_ngo(&s.ngo, &1, &10).get(0),
+        Some(second)
+    );
+
+    s.client.transfer_stream(&first, &other_ngo);
+    assert_eq!(
+        s.client.streams_by_ngo(&s.ngo, &0, &10).get(0),
+        Some(second)
+    );
+    assert_eq!(
+        s.client.streams_by_ngo(&other_ngo, &0, &10).get(0),
+        Some(first)
+    );
 }
 
 #[test]
