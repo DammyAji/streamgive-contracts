@@ -21,10 +21,26 @@ emergency `rescue_stream` path works while paused. It complements
 Key concepts:
 
 - A stream stores `balance` (undrawn deposit), `rate` (units per second),
-  `created_at` (fixed), `last_update` (moves on every checkpoint), `status`
-  (`Active`, `Drained`, or `Cancelled`), and `cancelled` (`bool`).
+  `created_at` (fixed), `start` (the cliff — accrual never runs before it),
+  `last_update` (moves on every checkpoint), `memo` (the donor's optional
+  tag, at most `MAX_MEMO_BYTES` (32) bytes, empty when none was supplied —
+  issue #341), `status` (`Active`, `Drained`, or `Cancelled`), and
+  `cancelled` (`bool`).
 - Nothing moves between checkpoints: accrual is computed lazily as
-  `min(rate × elapsed, balance)` (see `math::accrued`).
+  `min(rate × elapsed, balance)` (see `math::accrued`), where `elapsed` is
+  measured from `max(last_update, start)`.
+- `create_stream` sets `start = created_at`, so a plain stream accrues
+  immediately. `create_stream_with_start` takes an explicit `start` (up to one
+  year ahead, `MAX_START_DELAY_SECONDS`), so a scheduled or trial-period pledge
+  stays idle — `pending_accrual` is 0 and `withdraw` reverts with
+  `Error::NothingToWithdraw` — until that ledger time arrives. `depletion_time`
+  is likewise measured from `start`, and cancelling before `start` refunds the
+  whole deposit because nothing has accrued.
+- `create_stream_with_memo` creates an immediately-accruing stream tagged with
+  an optional donor `memo` (issue #341). The memo is stored on the record and
+  reported on the `created` event; anything over `MAX_MEMO_BYTES` (32) bytes is
+  rejected with `Error::MemoTooLong` rather than truncated. A plain
+  `create_stream` stores an empty memo.
 - Every payout is checkpointed, so `last_update` always marks the last time
   the stream was settled.
 
@@ -41,17 +57,17 @@ sequenceDiagram
 
     Note over Donor,Treasury: create
 
-    Donor->>Vault: create_stream(donor, ngo, token, deposit, rate)
+    Donor->>Vault: create_stream(donor, ngo, token, deposit, rate)  %% or create_stream_with_start / create_stream_with_memo
     activate Vault
-    Vault->>Vault: validate pause, auth, donor != ngo, amounts, cap, registry
-    Vault->>Vault: store Stream { balance = deposit, rate, status = Active, last_update = now }
+    Vault->>Vault: validate pause, auth, donor != ngo, amounts, cap, registry, memo
+    Vault->>Vault: store Stream { balance = deposit, rate, status = Active, start, last_update = now, memo }
     Vault->>Token: transfer(Donor → Vault, deposit)
-    Vault-->>Donor: created(stream_id, donor, ngo, token, deposit, rate)
+    Vault-->>Donor: created(stream_id, donor, ngo, token, deposit, rate, memo)
     deactivate Vault
 
     Note over Donor,Treasury: accrue (passive, between checkpoints)
 
-    Note over Vault: accrued = min(rate × (now − last_update), balance)
+    Note over Vault: accrued = min(rate × (now − max(last_update, start)), balance)
 
     Note over Donor,Treasury: withdraw
 
@@ -90,8 +106,16 @@ sequenceDiagram
 Notes:
 
 - `withdraw` and `withdraw_batch` require the **NGO's** auth; `create_stream`,
-  `top_up`, `modify_rate`, `transfer_stream`, and `cancel_stream` require the
-  **donor's** auth; `rescue_stream` requires the **admin's** auth.
+  `create_stream_with_start`, `create_stream_with_memo`, `top_up`,
+  `modify_rate`, `transfer_stream`, and
+  `cancel_stream` require the **donor's** auth; `rescue_stream` requires the
+  **admin's** auth.
+- `create_stream_with_start` is the cliff variant of `create_stream`: it
+  behaves identically once `start` has passed, but until then nothing accrues
+  and `depletion_time` counts from `start` rather than creation.
+- `create_stream_with_memo` is the tagged variant of `create_stream`: it
+  behaves identically, but stores the donor's `memo` (up to `MAX_MEMO_BYTES`
+  bytes) on the record and in the `created` event.
 - A stream with nothing accrued reverts `withdraw` with
   `Error::NothingToWithdraw`; `cancel_stream` on such a stream just refunds
   the whole balance.
@@ -257,7 +281,7 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Active: create_stream
+    [*] --> Active: create_stream / create_stream_with_start / create_stream_with_memo
     Active --> Active: withdraw / withdraw_batch / top_up / modify_rate / transfer_stream
     Active --> Drained: withdraw / withdraw_batch / settle (balance == 0)
     Drained --> Active: top_up

@@ -67,9 +67,28 @@ This project does not yet follow a formal versioning scheme — each contract's
   changes are handled across an `upgrade`, and the process for announcing
   breaking changes (#314).
 - `donation-vault`: `Error::InvalidNgo` (26) and `Error::InvalidToken` (27).
+- `donation-vault`: per-NGO payout address via `set_payout_address` /
+  `payout_address`, so an NGO can route `withdraw` / `withdraw_batch` payouts
+  to a treasury wallet while its owner key only authorises. Owner-auth-gated,
+  emits `payoutset`, and reported on the `withdraw` event.
+- `donation-vault`: optional per-second rate ceiling via `set_max_rate` /
+  `clear_max_rate` / `max_rate`. Off by default; when set, `create_stream`
+  and `modify_rate` reject rates above it with `Error::RateTooHigh` (#339).
+  Admin-gated, emits `maxrate` / `maxrtclr`, and reported by `get_config`.
+- `donation-vault`: `create_stream_with_start` for a stream that stays idle
+  behind a cliff until its `start` timestamp, so scheduled or trial-period
+  pledges don't accrue from the ledger of creation. The deposit is still
+  pulled up front; `pending_accrual` stays 0 before `start`, `depletion_time`
+  is measured from `start`, and cancelling before `start` refunds the whole
+  deposit. A `start` more than `MAX_START_DELAY_SECONDS` (one year) ahead is
+  rejected with `Error::StartTooFar` (#337).
 
 ### Changed
 
+- **BREAKING** `donation-vault`: the `withdraw` event data payload now includes
+  the payout destination, changing from `(accrued: i128, fee: i128, net: i128)`
+  to `(accrued: i128, fee: i128, net: i128, payout: Address)`. Off-chain
+  indexers and subscribers must update their `withdraw` event decoders.
 - **BREAKING** `donation-vault`: updated event data payloads to include net, fee,
   and settled amounts. `withdraw` now emits `(accrued: i128, fee: i128, net: i128)`
   instead of single-value `accrued`; `topup` now emits `(amount: i128, settled: i128)`
@@ -81,6 +100,18 @@ This project does not yet follow a formal versioning scheme — each contract's
   `min_deposit`, `max_streams_per_donor`, `registry`, `cancel_grace_ledgers`,
   `total_donated`, `pending_admin`, and `renounced`. Clients decoding the old
   struct shape will need updating.
+- **BREAKING** `donation-vault`: the `Config` returned by `get_config` gains a
+  `max_rate: Option<i128>` field (the per-second rate ceiling, `None` when
+  unset). Clients decoding the `Config` struct must add the new field (#339).
+- **BREAKING** `donation-vault`: the `Stream` struct gains a `start: u64` field
+  (the cliff timestamp, equal to `created_at` for a plain `create_stream`).
+  Off-chain decoders of the stored `Stream` record must add the new field
+  (#337).
+- **BREAKING** `donation-vault`: the `Stream` struct gains a `memo: Bytes`
+  field (the donor's optional tag, empty when none was supplied with
+  `create_stream`), and the `created` event data payload gains a trailing
+  `memo: Bytes`. Off-chain decoders of the stored `Stream` record and of the
+  `created` event must add the new field (#341).
 - `donation-vault`: stream `balance`/`withdrawn` updates and the stream-id
   counter use checked arithmetic, returning `Error::ArithmeticOverflow`
   instead of panicking on overflow.
@@ -95,6 +126,13 @@ This project does not yet follow a formal versioning scheme — each contract's
 
 ### Fixed
 
+- `donation-vault`: renumbered `Error::StreamAlreadyPaused` (was 26) and
+  `Error::StreamNotPaused` (was 27) to 32 and 33. Their old discriminants
+  collided with `Error::InvalidNgo` (26) and `Error::InvalidToken` (27),
+  which failed to compile (`E0081: discriminant value assigned more than
+  once`). Per the append-only policy the newer variants move; `InvalidNgo`
+  and `InvalidToken` keep their numbers. Any client matching on the old
+  numbers for the two pause variants must update.
 - `donation-vault`: `modify_rate` re-verifies the NGO with the configured
   registry when the rate is raised, matching `top_up` and `transfer_stream`,
   and fails with `Error::NgoNotVerified` for a revoked NGO. Lowering the rate
