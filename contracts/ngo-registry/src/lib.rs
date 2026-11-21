@@ -47,6 +47,13 @@ pub struct RemovedEvent {
     pub data: (),
 }
 
+#[contractevent(topics = ["rejected"], data_format = "single-value")]
+pub struct RejectedEvent {
+    #[topic]
+    pub owner: Address,
+    pub reason_code: u32,
+}
+
 #[contractevent(topics = ["propadmin"], data_format = "single-value")]
 pub struct ProposedAdminEvent {
     pub admin: Address,
@@ -128,7 +135,8 @@ pub enum Error {
     NotInitialized = 2,
     AlreadyRegistered = 3,
     NotRegistered = 4,
-    /// The NGO has already been approved, so its name is locked.
+    /// The NGO has already been approved: it can no longer be unregistered,
+    /// renamed, rejected, or approved again. Revoke it first.
     AlreadyVerified = 5,
     /// `name` is longer than `MAX_NGO_NAME_LEN` (200 bytes).
     NameTooLong = 6,
@@ -777,9 +785,74 @@ impl NgoRegistry {
         Ok(())
     }
 
+    /// Rejects a pending NGO application, removing its entry and publishing the
+    /// supplied `reason_code` so the applicant's client can explain why it was
+    /// not approved. Callable by the admin or any listed approver (see
+    /// `add_approver`), and the counterpart to `approve_ngo` for a reviewer who
+    /// decides against an application rather than leaving it pending.
+    ///
+    /// The entry, its position in the owners index, and the live counts are
+    /// cleared exactly as in `remove_ngo`, so the owner can address the problem
+    /// and register again. The `reason_code` is an opaque, caller-defined
+    /// integer (for example, an off-chain enum agreed between the registry and
+    /// its clients); the contract keeps no record of it beyond the event.
+    ///
+    /// Returns `Error::NotRegistered` for an address with no entry. A verified
+    /// NGO cannot be rejected — an approval is undone with `revoke_ngo` first —
+    /// and fails with `Error::AlreadyVerified`. An address that is neither the
+    /// admin nor a listed approver fails with `Error::NotApprover`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env, String};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryArgs, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let admin = Address::generate(&env);
+    /// # let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// let applicant = Address::generate(&env);
+    /// client.register(&applicant, &String::from_str(&env, "Unverified Charity"));
+    ///
+    /// // 3 = "could not verify registration documents".
+    /// client.reject_ngo(&admin, &applicant, &3);
+    /// assert!(client.try_get_ngo(&applicant).is_err());
+    /// ```
+    pub fn reject_ngo(
+        env: Env,
+        approver: Address,
+        ngo_owner: Address,
+        reason_code: u32,
+    ) -> Result<(), Error> {
+        require_approver(&env, &approver)?;
+
+        let key = DataKey::Ngo(ngo_owner.clone());
+        let ngo: Ngo = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotRegistered)?;
+        if ngo.verified {
+            return Err(Error::AlreadyVerified);
+        }
+
+        delete_ngo_entry(&env, &ngo_owner)?;
+
+        extend_instance_ttl(&env);
+        RejectedEvent {
+            owner: ngo_owner,
+            reason_code,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
     /// Adds an address to the approver list. Admin-only.
     ///
-    /// Approvers may call `approve_ngo`, `batch_approve`, and `revoke_ngo`
+    /// Approvers may call `approve_ngo`, `batch_approve`, `reject_ngo`, and
+    /// `revoke_ngo`
     /// without holding the admin key, which is how review work is delegated
     /// without granting control over upgrades or admin transfer. The admin is
     /// always able to review whether or not it appears in this list, so adding

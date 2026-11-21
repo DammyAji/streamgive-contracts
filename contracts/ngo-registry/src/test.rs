@@ -1889,3 +1889,186 @@ fn approver_does_not_gain_admin_rights() {
     assert!(client.try_remove_ngo(&owner).is_err());
     assert!(client.get_ngo(&owner).verified == false);
 }
+
+// =============================================================================
+// reject_ngo with a reason code (issue #350)
+// =============================================================================
+
+#[test]
+fn reject_ngo_removes_pending_entry_and_emits_event() {
+    let (env, client, admin) = setup();
+    let owner = Address::generate(&env);
+    let reason_code = 7u32;
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    client.reject_ngo(&admin, &owner, &reason_code);
+
+    assert_eq!(client.try_get_ngo(&owner), Err(Ok(Error::NotRegistered)));
+    assert!(!client.is_verified(&owner));
+    assert_eq!(client.total_ngos(), 0);
+    assert_eq!(client.list_ngos(&0, &10).len(), 0);
+    // Events are cleared per top-level call, so only the rejected event shows.
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("rejected"), owner).into_val(&env),
+                reason_code.into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn reject_ngo_publishes_distinct_reason_codes() {
+    let (env, client, admin) = setup();
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.register(&a, &String::from_str(&env, "A"));
+    client.register(&b, &String::from_str(&env, "B"));
+
+    client.reject_ngo(&admin, &a, &1);
+    client.reject_ngo(&admin, &b, &99);
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("rejected"), b).into_val(&env),
+                99u32.into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn reject_ngo_rejects_a_verified_ngo() {
+    let (env, client, admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+
+    let result = client.try_reject_ngo(&admin, &owner, &3);
+
+    assert_eq!(result, Err(Ok(Error::AlreadyVerified)));
+    // Untouched: revoke_ngo is the way to undo an approval.
+    assert!(client.get_ngo(&owner).verified);
+    assert_eq!(client.total_ngos(), 1);
+}
+
+#[test]
+fn reject_ngo_after_revocation_succeeds() {
+    let (env, client, admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+    client.revoke_ngo(&admin, &owner);
+
+    client.reject_ngo(&admin, &owner, &3);
+
+    assert_eq!(client.try_get_ngo(&owner), Err(Ok(Error::NotRegistered)));
+    assert_eq!(client.total_ngos(), 0);
+}
+
+#[test]
+fn reject_ngo_unknown_owner_fails() {
+    let (env, client, admin) = setup();
+    let unknown = Address::generate(&env);
+
+    let result = client.try_reject_ngo(&admin, &unknown, &3);
+
+    assert_eq!(result, Err(Ok(Error::NotRegistered)));
+}
+
+#[test]
+fn admin_can_reject_without_being_listed() {
+    let (env, client, admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    assert!(!client.is_approver(&admin));
+    client.reject_ngo(&admin, &owner, &3);
+
+    assert_eq!(client.try_get_ngo(&owner), Err(Ok(Error::NotRegistered)));
+}
+
+#[test]
+fn approver_can_reject() {
+    let (env, client, _admin) = setup();
+    let reviewer = Address::generate(&env);
+    let owner = Address::generate(&env);
+    client.add_approver(&reviewer);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    client.reject_ngo(&reviewer, &owner, &3);
+
+    assert_sole_auth(&env, &client, &reviewer, "reject_ngo");
+    assert_eq!(client.try_get_ngo(&owner), Err(Ok(Error::NotRegistered)));
+}
+
+#[test]
+fn non_approver_cannot_reject() {
+    let (env, client, _admin) = setup();
+    let outsider = Address::generate(&env);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    let result = client.try_reject_ngo(&outsider, &owner, &3);
+
+    assert_eq!(result, Err(Ok(Error::NotApprover)));
+    assert!(client.get_ngo(&owner).verified == false);
+}
+
+#[test]
+fn removed_approver_can_no_longer_reject() {
+    let (env, client, _admin) = setup();
+    let reviewer = Address::generate(&env);
+    let owner = Address::generate(&env);
+    client.add_approver(&reviewer);
+    client.remove_approver(&reviewer);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    let result = client.try_reject_ngo(&reviewer, &owner, &3);
+
+    assert_eq!(result, Err(Ok(Error::NotApprover)));
+}
+
+#[test]
+#[should_panic]
+fn reject_ngo_without_auth_fails() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    env.mock_auths(&[]);
+    client.reject_ngo(&Address::generate(&env), &owner, &3);
+}
+
+#[test]
+fn reject_ngo_frees_the_index_and_lets_the_owner_register_again() {
+    let (env, client, admin) = setup();
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let c = Address::generate(&env);
+    client.register(&a, &String::from_str(&env, "A"));
+    client.register(&b, &String::from_str(&env, "B"));
+    client.register(&c, &String::from_str(&env, "C"));
+
+    client.reject_ngo(&admin, &b, &3);
+
+    let owners = client.list_ngos(&0, &10);
+    assert_eq!(owners.len(), 2);
+    assert_eq!(owners.get(0).unwrap(), a);
+    assert_eq!(owners.get(1).unwrap(), c);
+    assert_eq!(client.total_ngos(), 2);
+
+    // The rejected owner can apply again from scratch.
+    client.register(&b, &String::from_str(&env, "B again"));
+    assert!(!client.get_ngo(&b).verified);
+    assert_eq!(client.total_ngos(), 3);
+}
+

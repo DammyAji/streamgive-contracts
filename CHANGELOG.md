@@ -89,6 +89,13 @@ This project does not yet follow a formal versioning scheme — each contract's
   the acting address (`Error::NotApprover` otherwise). Adds `Error::NotApprover`
   (12) and `Error::AlreadyApprover` (13), emits `apadd` / `aprem`, and backs the
   new `DataKey::Approvers` instance key (#349).
+- `ngo-registry`: `reject_ngo(approver, ngo_owner, reason_code)` so a reviewer can
+  decline a pending application and tell the applicant why: it removes the entry
+  (freeing the owner to register again) and emits `rejected` carrying the opaque,
+  caller-defined `reason_code`. Like the other review entry points it is callable
+  by the admin or a listed approver (`Error::NotApprover` otherwise), and it
+  rejects an already-verified NGO with `Error::AlreadyVerified` — an approval is
+  undone with `revoke_ngo` first (#350).
 
 ### Changed
 

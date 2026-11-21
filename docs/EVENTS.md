@@ -85,12 +85,30 @@ outright, without waiting for its owner to `unregister`. Like `unregist` this
 is the owner-initiated counterpart, but admin-initiated and carrying the same
 payload. A verified NGO cannot be removed directly: it must be revoked first,
 so a `removed` event never follows an un-revoked `approved` for the same
-`owner`.
+`owner`. `remove_ngo` is the reason-less variant of `reject_ngo`; prefer
+`reject_ngo` when the applicant should learn why.
 
 | | |
 |---|---|
 | Topics | `("removed", owner: Address)` |
 | Data | `()` (no payload) |
+
+### `rejected`
+
+Emitted by `reject_ngo` when the admin — or a listed approver — declines a
+pending application, removing the entry and recording why. The `reason_code`
+is the caller-supplied integer passed to `reject_ngo`: an opaque,
+off-chain-defined code the applicant's client can map to a human explanation.
+The contract keeps no other record of the decision.
+
+| | |
+|---|---|
+| Topics | `("rejected", owner: Address)` |
+| Data | `reason_code: u32` |
+
+Like `removed`, a `rejected` event only follows an unapproved entry: a verified
+NGO must be `revoke`d first, so `reject_ngo` never drops a live verification and
+never emits for an already-verified address (it fails with `AlreadyVerified`).
 
 ### `init`
 
@@ -114,7 +132,8 @@ Emitted by `upgrade` when an admin replaces the registry's Wasm bytecode.
 ### `apadd`
 
 Emitted by `add_approver` when the admin adds an address to the approver list,
-granting it the right to call `approve_ngo`, `batch_approve`, and `revoke_ngo`.
+granting it the right to call `approve_ngo`, `batch_approve`, `reject_ngo`, and
+`revoke_ngo`.
 
 | | |
 |---|---|
