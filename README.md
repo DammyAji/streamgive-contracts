@@ -78,6 +78,7 @@ keep-alive, continues to work. The table below lists every public entry point.
 | `top_up` | **Rejected** — `ContractPaused` |
 | `modify_rate` | **Rejected** — `ContractPaused` |
 | `transfer_stream` | **Rejected** — `ContractPaused` |
+| `sweep_surplus` | **Rejected** — admin-gated; `ContractPaused` |
 | `cancel_stream` | **Works** — donor auth; settles accrued payouts and refunds the unspent balance |
 | `rescue_stream` | **Only works while paused** — admin-only emergency path; returns `NotPaused` when the vault is active |
 | `pause` | **Rejected** when already paused — `AlreadyPaused` |
@@ -87,8 +88,8 @@ keep-alive, continues to work. The table below lists every public entry point.
 | `init`, `__constructor` | **Works** during setup; neither has a pause gate (the vault cannot be paused before it is initialised) |
 | `propose_admin`, `accept_admin`, `cancel_admin_proposal` | **Work** — admin handshake is not paused |
 | `set_treasury`, `clear_treasury`, `set_fee_bps`, `set_token_fee_bps`, `clear_token_fee_bps` | **Work** — admin-gated configuration; no pause gate |
-| `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_max_rate`, `clear_max_rate`, `set_registry`, `clear_registry`, `upgrade` | **Work** — admin-gated configuration; no pause gate |
-| `total_donated`, `admin`, `pending_admin`, `get_stream`, `streams_by_donor`, `stream_count`, `pending_accrual`, `depletion_time`, `pending_payout`, `paused`, `get_config`, `treasury`, `fee_bps`, `max_fee_bps`, `token_fee_bps`, `allowed_tokens`, `min_deposit`, `cancel_grace_ledgers`, `max_streams_per_donor`, `max_rate`, `registry`, `payout_address` | **Work** — read-only views are never paused |
+| `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_max_rate`, `clear_max_rate`, `set_registry`, `clear_registry`, `upgrade`, `set_upgrade_delay`, `propose_upgrade`, `execute_upgrade`, `cancel_upgrade` | **Work** — admin-gated configuration; no pause gate |
+| `total_donated`, `admin`, `pending_admin`, `get_stream`, `streams_by_donor`, `stream_count`, `pending_accrual`, `depletion_time`, `pending_payout`, `paused`, `get_config`, `treasury`, `fee_bps`, `max_fee_bps`, `token_fee_bps`, `allowed_tokens`, `min_deposit`, `cancel_grace_ledgers`, `max_streams_per_donor`, `max_rate`, `registry`, `payout_address`, `upgrade_delay`, `pending_upgrade`, `committed_balance`, `surplus` | **Work** — read-only views are never paused |
 
 Pausing does **not** stop time-based accrual. A stream's `pending_accrual`
 keeps growing while the vault is paused, so a stream paused for a week still
@@ -301,18 +302,18 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 ### `donation-vault`
 
 Codes are append-only and never renumbered; the `donation-vault` enum is
-currently allocated up to code 33. See [docs/UPGRADE_POLICY.md](docs/UPGRADE_POLICY.md). "Admin-gated" entry points first call
+currently allocated up to code 38. See [docs/UPGRADE_POLICY.md](docs/UPGRADE_POLICY.md). "Admin-gated" entry points first call
 `require_admin`, so they can also return `NotInitialized` (no admin) or
 `AdminRenounced`.
 
 | Code | Error | Meaning | Entry points |
 | --- | --- | --- | --- |
 | 1 | `AlreadyInitialized` | `init` already created an admin. | `init` |
-| 2 | `NotInitialized` | No admin is stored. | `admin`, `propose_admin`, `cancel_admin_proposal`, `pause`, `unpause`, `set_treasury`, `clear_treasury`, `set_fee_bps`, `set_token_fee_bps`, `clear_token_fee_bps`, `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_registry`, `renounce_admin`, `rescue_stream`, `upgrade` |
+| 2 | `NotInitialized` | No admin is stored. | `admin`, `propose_admin`, `cancel_admin_proposal`, `pause`, `unpause`, `set_treasury`, `clear_treasury`, `set_fee_bps`, `set_token_fee_bps`, `clear_token_fee_bps`, `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_registry`, `renounce_admin`, `rescue_stream`, `upgrade`, `set_upgrade_delay`, `propose_upgrade`, `execute_upgrade`, `cancel_upgrade`, `sweep_surplus` |
 | 3 | `StreamNotFound` | No stream exists for the id. | `get_stream`, `pending_accrual`, `depletion_time`, `pending_payout`, `extend_stream`, `withdraw`, `withdraw_batch`, `cancel_stream`, `rescue_stream`, `top_up`, `modify_rate`, `transfer_stream` |
-| 4 | `InvalidAmount` | A deposit, rate, top-up, rate change, or minimum deposit was zero/negative (or a fee would swallow the first payout). | `create_stream`, `create_stream_with_start`, `create_stream_with_memo`, `top_up`, `modify_rate`, `set_min_deposit` |
+| 4 | `InvalidAmount` | A deposit, rate, top-up, rate change, minimum deposit, or sweep amount was zero/negative (or a fee would swallow the first payout). | `create_stream`, `create_stream_with_start`, `create_stream_with_memo`, `top_up`, `modify_rate`, `set_min_deposit`, `sweep_surplus` |
 | 5 | `NothingToWithdraw` | The stream accrued nothing since its last checkpoint. | `withdraw` |
-| 6 | `ContractPaused` | The admin paused the vault; see [Pausing](#pausing). | `create_stream`, `create_stream_with_start`, `create_stream_with_memo`, `withdraw`, `withdraw_batch`, `top_up`, `modify_rate`, `transfer_stream` |
+| 6 | `ContractPaused` | The admin paused the vault; see [Pausing](#pausing). | `create_stream`, `create_stream_with_start`, `create_stream_with_memo`, `withdraw`, `withdraw_batch`, `top_up`, `modify_rate`, `transfer_stream`, `sweep_surplus` |
 | 7 | `FeeTooHigh` | Fee above the 1,000 bps (10%) cap. | `set_fee_bps`, `set_token_fee_bps` |
 | 8 | `NoPendingAdmin` | No admin proposal is pending. | `accept_admin`, `cancel_admin_proposal` |
 | 9 | `ArithmeticOverflow` | Checked balance, total, counter, or grace-ledger arithmetic left `i128`/`u64` range. | `create_stream`, `create_stream_with_start`, `create_stream_with_memo`, `withdraw`, `withdraw_batch`, `cancel_stream`, `top_up`, `modify_rate`, `transfer_stream`, `set_cancel_grace_ledgers` |
@@ -326,7 +327,7 @@ currently allocated up to code 33. See [docs/UPGRADE_POLICY.md](docs/UPGRADE_POL
 | 17 | `StreamLimitExceeded` | Donor reached `max_streams_per_donor`. | `create_stream`, `create_stream_with_start`, `create_stream_with_memo` |
 | 18 | `NgoNotVerified` | A configured registry has no verified entry for the NGO. | `create_stream`, `create_stream_with_start`, `create_stream_with_memo`, `top_up`, `transfer_stream`, `modify_rate` (rate increases only) |
 | 19 | `StreamCounterMissing` | The stream-id counter is absent from instance storage. | `create_stream`, `create_stream_with_start`, `create_stream_with_memo` |
-| 20 | `AdminRenounced` | Admin control was permanently renounced, or `init` ran after a renounce. | `init`, `admin`, `propose_admin`, `cancel_admin_proposal`, `pause`, `unpause`, `set_treasury`, `clear_treasury`, `set_fee_bps`, `set_token_fee_bps`, `clear_token_fee_bps`, `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_registry`, `renounce_admin`, `rescue_stream`, `upgrade` |
+| 20 | `AdminRenounced` | Admin control was permanently renounced, or `init` ran after a renounce. | `init`, `admin`, `propose_admin`, `cancel_admin_proposal`, `pause`, `unpause`, `set_treasury`, `clear_treasury`, `set_fee_bps`, `set_token_fee_bps`, `clear_token_fee_bps`, `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_registry`, `renounce_admin`, `rescue_stream`, `upgrade`, `set_upgrade_delay`, `propose_upgrade`, `execute_upgrade`, `cancel_upgrade`, `sweep_surplus` |
 | 21 | `FeeRequiresTreasury` | A non-zero fee was set with no treasury, or the treasury was cleared while a fee is set. | `set_fee_bps`, `set_token_fee_bps`, `clear_treasury` |
 | 22 | `NotPaused` | `rescue_stream` called while the vault is active. | `rescue_stream` |
 | 23 | `MixedNgo` | A batch withdrawal mixed streams belonging to different NGOs. | `withdraw_batch` |
@@ -340,10 +341,15 @@ currently allocated up to code 33. See [docs/UPGRADE_POLICY.md](docs/UPGRADE_POL
 | 31 | `MemoTooLong` | `create_stream_with_memo` was given a `memo` longer than `MAX_MEMO_BYTES` (32) bytes. | `create_stream_with_memo` |
 | 32 | `StreamAlreadyPaused` | `pause_stream` called on a stream that is already paused. | `pause_stream` |
 | 33 | `StreamNotPaused` | `resume_stream` called on a stream that is not paused. | `resume_stream` |
+| 34 | `NoPendingUpgrade` | `execute_upgrade` or `cancel_upgrade` was called with no upgrade proposed. | `execute_upgrade`, `cancel_upgrade` |
+| 35 | `UpgradeDelayNotElapsed` | `execute_upgrade` was called before the proposed upgrade's timelock elapsed. | `execute_upgrade` |
+| 36 | `UpgradeTimelockEnabled` | The immediate `upgrade` entry point was called while a non-zero `upgrade_delay` is configured. | `upgrade` |
+| 37 | `NoTreasury` | `sweep_surplus` was called before a treasury was configured, so the surplus has nowhere to go. | `sweep_surplus` |
+| 38 | `SweepExceedsSurplus` | `sweep_surplus` was asked to move more than the surplus above the token's committed balance, which would dip into stream funds. | `sweep_surplus` |
 
 ### `ngo-registry`
 
-Codes 1–13 are the full `Error` enum. The same append-only rule applies. Admin-gated entry points first call
+Codes 1–15 are the full `Error` enum. The same append-only rule applies. Admin-gated entry points first call
 `require_admin`, and the review entry points first call `require_approver`, so they can also return
 `NotInitialized` or `NotApprover`. The admin is an implicit approver: the
 registry keeps an admin-managed list of additional addresses permitted to
@@ -354,18 +360,20 @@ key.
 | Code | Error | Meaning | Entry points |
 | --- | --- | --- | --- |
 | 1 | `AlreadyInitialized` | `init` already created an admin. | `init` |
-| 2 | `NotInitialized` | No admin is stored. | `admin`, `propose_admin`, `cancel_admin_proposal`, `approve_ngo`, `batch_approve`, `reject_ngo`, `revoke_ngo`, `add_approver`, `remove_approver`, `upgrade` |
+| 2 | `NotInitialized` | No admin is stored. | `admin`, `propose_admin`, `cancel_admin_proposal`, `approve_ngo`, `batch_approve`, `reject_ngo`, `revoke_ngo`, `add_approver`, `remove_approver`, `set_verify_period`, `renew_ngo`, `upgrade` |
 | 3 | `AlreadyRegistered` | The owner already has a registry entry. | `register` |
-| 4 | `NotRegistered` | No entry exists for the owner. | `unregister`, `update_name`, `get_ngo`, `approve_ngo`, `batch_approve`, `reject_ngo`, `revoke_ngo`, `touch_ngo` |
+| 4 | `NotRegistered` | No entry exists for the owner. | `unregister`, `update_name`, `set_metadata_uri`, `get_ngo`, `approve_ngo`, `batch_approve`, `reject_ngo`, `revoke_ngo`, `renew_ngo`, `touch_ngo` |
 | 5 | `AlreadyVerified` | The action is not allowed once an NGO is verified: unregister, rename, reject, or approve again. | `unregister`, `update_name`, `approve_ngo`, `batch_approve`, `reject_ngo` |
 | 6 | `NameTooLong` | Name exceeds 200 bytes. | `register`, `update_name` |
-| 7 | `NotVerified` | `revoke_ngo` called on an NGO that is not verified. | `revoke_ngo` |
+| 7 | `NotVerified` | `revoke_ngo` or `renew_ngo` called on an NGO that is not verified. | `revoke_ngo`, `renew_ngo` |
 | 8 | `NoPendingAdmin` | No admin proposal is pending. | `accept_admin`, `cancel_admin_proposal` |
 | 9 | `InvalidAdmin` | The proposed admin equals the current admin. | `propose_admin` |
 | 10 | `ArithmeticOverflow` | The owner index or total count left `u32`/`u64` range. | `register` |
 | 11 | `InvalidName` | The name is empty or whitespace-only. | `register` |
 | 12 | `NotApprover` | The acting address is neither the admin nor on the approver list. | `approve_ngo`, `batch_approve`, `reject_ngo`, `revoke_ngo`, `remove_approver` |
 | 13 | `AlreadyApprover` | The address is already on the approver list. | `add_approver` |
+| 14 | `MetadataUriTooLong` | The metadata URI exceeds 512 bytes. | `set_metadata_uri` |
+| 15 | `NoVerifyPeriod` | `renew_ngo` was called while no verification period is configured. | `renew_ngo` |
 
 ## Status
 

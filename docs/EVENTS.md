@@ -22,9 +22,11 @@ layout stable. Event type names include `RegisterEvent`, `RenamedEvent`,
 `MinDepositSetEvent`, `CancelGraceLedgersSetEvent`, `RegistrySetEvent`,
 `PayoutAddressSetEvent`, `MaxStreamsPerDonorSetEvent`, `MaxRateSetEvent`,
 `MaxRateClearedEvent`, `InitializedEvent`,
-`UpgradedEvent`, `ApproverAddedEvent`, `ApproverRemovedEvent`,
-`CreatedEvent`, `WithdrawnEvent`, `CancelledStreamEvent`, `RescuedStreamEvent`,
-`ToppedUpEvent`, and `RateModifiedEvent`.
+`UpgradedEvent`, `UpgradeProposedEvent`, `UpgradeCancelledEvent`,
+`UpgradeDelaySetEvent`, `ApproverAddedEvent`, `ApproverRemovedEvent`,
+`MetadataUriSetEvent`, `RenewedEvent`, `VerifyPeriodSetEvent`, `CreatedEvent`,
+`WithdrawnEvent`, `CancelledStreamEvent`, `RescuedStreamEvent`, `ToppedUpEvent`,
+`RateModifiedEvent`, and `SurplusSweptEvent`.
 
 `Address`, `i128`, `u64`, `u32`, `bool`, and `String` are the standard
 Soroban SDK/XDR types (`Address` is the SDK's account/contract address
@@ -57,6 +59,22 @@ before it has been approved.
 Once an `approved` event has been seen for an `owner`, no further
 `renamed` events can follow for it while it stays verified.
 
+### `metadata`
+
+Emitted by `set_metadata_uri` when an NGO changes the metadata URI on its own
+entry (a reference to off-chain metadata such as a website, description, or
+logo). It fires whenever the stored value changes, including when the URI is
+cleared.
+
+| | |
+|---|---|
+| Topics | `("metadata", owner: Address)` |
+| Data | `metadata_uri: Option<String>` (`None` when cleared) |
+
+Unlike `renamed`, `metadata` can follow an `approved` event: the URI is not
+frozen by verification, so an approved NGO keeps its published reference
+current. The value is at most `MAX_METADATA_URI_LEN` (512 bytes).
+
 ### `approved`
 
 Emitted by `approve_ngo` when an admin marks a registered NGO as verified.
@@ -65,6 +83,12 @@ Emitted by `approve_ngo` when an admin marks a registered NGO as verified.
 |---|---|
 | Topics | `("approved", ngo_owner: Address)` |
 | Data | `()` (no payload) |
+
+When a verification period is configured, approval also stamps
+`Ngo.verified_until` on the entry; the event payload itself is unchanged, so
+read `get_ngo` for the expiry. A lapsed verification is reported as
+unverified by `get_ngo` / `is_verified`, and is revived with `renew_ngo`
+(see the `renew` event).
 
 ### `revoked`
 
@@ -157,6 +181,33 @@ approver list, revoking that right.
 
 Removing an address that is not on the list fails with `NotApprover` and
 emits nothing.
+
+### `renew`
+
+Emitted by `renew_ngo` when the admin extends an NGO's verification, moving
+its expiry forward from the current ledger time by the configured verification
+period. The `data` is the new expiry as a ledger timestamp, and it is
+readable as `Ngo.verified_until` from `get_ngo`.
+
+| | |
+|---|---|
+| Topics | `("renew", owner: Address)` |
+| Data | `verified_until: u64` |
+
+A verification that has lapsed can be renewed as long as its stored flag is
+still set; one that was revoked must be approved again first.
+
+### `verperiod`
+
+Emitted by `set_verify_period` when the admin changes the verification period.
+`data` is the new period in seconds; `0` means approvals never expire. The
+period applies to `approve_ngo` / `batch_approve` and `renew_ngo` from that
+point on, and does not alter entries already approved.
+
+| | |
+|---|---|
+| Topics | `("verperiod",)` |
+| Data | `verify_period: u64` |
 
 ## `donation-vault`
 
@@ -372,12 +423,71 @@ polling `payout_address`.
 
 ### `upgrade`
 
-Emitted by `upgrade` when an admin replaces the vault's Wasm bytecode.
+Emitted by `upgrade` and by `execute_upgrade` when an admin replaces the
+vault's Wasm bytecode.
 
 | | |
 |---|---|
 | Topics | `("upgrade",)` |
 | Data | `new_wasm_hash: BytesN<32>` |
+
+`upgrade` only publishes this while the upgrade timelock is disabled (a
+configured `upgrade_delay` of zero). With a non-zero delay it returns
+`Error::UpgradeTimelockEnabled`, and the code change happens through
+`execute_upgrade` instead (#343).
+
+### `uppropose`
+
+Emitted by `propose_upgrade` when an admin records the Wasm hash to upgrade to
+and the timestamp from which the upgrade may be executed.
+
+| | |
+|---|---|
+| Topics | `("uppropose", new_wasm_hash: BytesN<32>)` |
+| Data | `executable_at: u64` |
+
+`executable_at` is the ledger timestamp before which `execute_upgrade` returns
+`Error::UpgradeDelayNotElapsed`. Proposing again replaces any pending proposal
+and restarts the timer (#343).
+
+### `upcancel`
+
+Emitted by `cancel_upgrade` when an admin withdraws a pending proposal before
+it is executed.
+
+| | |
+|---|---|
+| Topics | `("upcancel",)` |
+| Data | `new_wasm_hash: BytesN<32>` |
+
+The hash is the one that was pending, so an indexer can correlate the
+cancellation with the earlier `uppropose` (#343).
+
+### `updelay`
+
+Emitted by `set_upgrade_delay` when an admin changes how long the upgrade
+timelock lasts.
+
+| | |
+|---|---|
+| Topics | `("updelay",)` |
+| Data | `delay: u64` (the new delay in seconds; `0` disables the timelock) |
+
+### `sweep`
+
+Emitted by `sweep_surplus` when an admin moves tokens that were sent to the
+vault by mistake to the treasury.
+
+| | |
+|---|---|
+| Topics | `("sweep", token: Address)` |
+| Data | `(amount: i128, treasury: Address)` |
+
+`amount` never exceeds the surplus above the token's committed balance (the sum
+of stream balances the vault holds), so a sweep can never touch funds belonging
+to streams. `treasury` is the payout address the surplus went to. An indexer can
+reconstruct the recoverable surplus at any time as the vault's token balance
+minus `committed_balance(token)` (#346).
 
 ### `created`
 

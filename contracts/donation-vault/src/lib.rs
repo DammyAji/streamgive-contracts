@@ -196,6 +196,45 @@ pub struct UpgradedEvent {
     pub new_wasm_hash: BytesN<32>,
 }
 
+#[contractevent(topics = ["uppropose"], data_format = "single-value")]
+pub struct UpgradeProposedEvent {
+    #[topic]
+    pub new_wasm_hash: BytesN<32>,
+    pub executable_at: u64,
+}
+
+#[contractevent(topics = ["upcancel"], data_format = "single-value")]
+pub struct UpgradeCancelledEvent {
+    pub new_wasm_hash: BytesN<32>,
+}
+
+#[contractevent(topics = ["updelay"], data_format = "single-value")]
+pub struct UpgradeDelaySetEvent {
+    pub delay: u64,
+}
+
+/// Emitted by `sweep_surplus` when the admin moves tokens that were sent to
+/// the vault by mistake (above the committed balance for that token) to the
+/// treasury. See issue #346.
+#[contractevent(topics = ["sweep"], data_format = "vec")]
+pub struct SurplusSweptEvent {
+    #[topic]
+    pub token: Address,
+    pub amount: i128,
+    pub treasury: Address,
+}
+
+/// A contract upgrade recorded by `propose_upgrade`, awaiting the timelock
+/// before `execute_upgrade` may carry it out. See issue #343.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingUpgrade {
+    /// The Wasm hash the contract will be upgraded to on execution.
+    pub new_wasm_hash: BytesN<32>,
+    /// Ledger timestamp at or after which `execute_upgrade` may run.
+    pub executable_at: u64,
+}
+
 mod math;
 
 /// Mirrors ngo-registry's `Ngo` record for cross-contract calls. Declared
@@ -354,6 +393,17 @@ pub enum DataKey {
     /// The address an NGO has configured to receive withdrawals, keyed by the
     /// NGO owner address. Absent means payouts go to the owner address itself.
     NgoPayoutAddress(Address),
+    /// Seconds that must elapse between `propose_upgrade` and
+    /// `execute_upgrade`. Zero (or absent) means the timelock is disabled and
+    /// the immediate `upgrade` entry point is allowed. See issue #343.
+    UpgradeDelay,
+    /// The upgrade recorded by `propose_upgrade` and not yet executed or
+    /// cancelled. Absent means no upgrade is pending.
+    PendingUpgrade,
+    /// Per-token total of funds the vault holds on behalf of streams (the sum
+    /// of stream balances for that token). Used by `sweep_surplus` to bound a
+    /// sweep to the surplus above it. Absent means zero. See issue #346.
+    CommittedBalance(Address),
 }
 
 #[contracterror]
@@ -445,6 +495,22 @@ pub enum Error {
     StreamAlreadyPaused = 32,
     /// `resume_stream` was called on a stream that is not paused.
     StreamNotPaused = 33,
+    /// `execute_upgrade` or `cancel_upgrade` was called with no upgrade
+    /// proposed.
+    NoPendingUpgrade = 34,
+    /// `execute_upgrade` was called before the proposed upgrade's timelock
+    /// elapsed.
+    UpgradeDelayNotElapsed = 35,
+    /// The immediate `upgrade` entry point was called while a non-zero
+    /// `upgrade_delay` is configured: upgrades must go through
+    /// `propose_upgrade` / `execute_upgrade`.
+    UpgradeTimelockEnabled = 36,
+    /// `sweep_surplus` was called before a treasury was configured, so the
+    /// surplus has nowhere to go.
+    NoTreasury = 37,
+    /// `sweep_surplus` was asked to move more than the surplus above the
+    /// token's committed balance, which would dip into stream funds.
+    SweepExceedsSurplus = 38,
     // Error numbers are append-only: never renumber, reuse, or remove a
     // variant. New errors take the next unused number. See
     // docs/UPGRADE_POLICY.md.
@@ -560,6 +626,49 @@ fn require_not_paused(env: &Env) -> Result<(), Error> {
     if paused {
         return Err(Error::ContractPaused);
     }
+    Ok(())
+}
+
+/// Reads the admin-configured upgrade timelock, in seconds. Defaults to zero
+/// (timelock disabled) when an admin has not set one.
+fn get_upgrade_delay(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::UpgradeDelay)
+        .unwrap_or(0)
+}
+
+/// Reads the amount of `token` the vault holds on behalf of streams. Absent
+/// means zero. See issue #346.
+fn get_committed(env: &Env, token: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CommittedBalance(token.clone()))
+        .unwrap_or(0)
+}
+
+/// Writes the committed balance for `token`, removing the entry entirely when
+/// it reaches zero so storage isn't left holding a stale key.
+fn set_committed(env: &Env, token: &Address, amount: i128) {
+    let key = DataKey::CommittedBalance(token.clone());
+    if amount == 0 {
+        env.storage().persistent().remove(&key);
+        return;
+    }
+    env.storage().persistent().set(&key, &amount);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+}
+
+/// Adjusts the committed balance for `token` by `delta`, which may be negative
+/// (a payout or refund leaving the vault). Checked so a broken invariant aborts
+/// rather than wrapping. See issue #346.
+fn add_committed(env: &Env, token: &Address, delta: i128) -> Result<(), Error> {
+    let next = get_committed(env, token)
+        .checked_add(delta)
+        .ok_or(Error::ArithmeticOverflow)?;
+    set_committed(env, token, next);
     Ok(())
 }
 
@@ -756,6 +865,10 @@ fn settle(env: &Env, stream: &mut Stream, now: u64) -> Result<i128, Error> {
 
     // External token transfer is the last step
     if accrued > 0 {
+        // The accrued amount leaves the vault's committed balance here: this
+        // is the single place a payout is sent, so every entry point that
+        // settles a stream inherits the reduction (issue #346).
+        add_committed(env, &stream.token, -accrued)?;
         let token_client = token::Client::new(env, &stream.token);
         let fee = compute_fee(env, &stream.token, accrued);
         record_outflow_totals(env, accrued, fee)?;
@@ -925,6 +1038,10 @@ fn create_stream_inner(
 
     extend_instance_ttl(&env);
     extend_stream_ttl(&env, stream_id);
+
+    // The deposit now belongs to this stream, so record it against the
+    // token's committed balance before the funds move (issue #346).
+    add_committed(&env, &token, deposit)?;
 
     // External token transfer is the last step
     let token_client = token::Client::new(&env, &token);
@@ -2626,6 +2743,10 @@ impl DonationVault {
         extend_instance_ttl(&env);
         extend_stream_ttl(&env, stream_id);
 
+        // The accrued amount is leaving the vault, so it no longer counts
+        // against the token's committed balance (issue #346).
+        add_committed(&env, &stream.token, -accrued)?;
+
         let token_client = token::Client::new(&env, &stream.token);
         let payout = payout_destination(&env, &stream.ngo);
         let net = pay_ngo(&env, &token_client, &payout, accrued);
@@ -2716,6 +2837,7 @@ impl DonationVault {
         let mut accrued_amounts: Vec<i128> = Vec::new(&env);
         let mut net_payouts: Map<Address, i128> = Map::new(&env);
         let mut fee_payouts: Map<Address, i128> = Map::new(&env);
+        let mut gross_payouts: Map<Address, i128> = Map::new(&env);
         let mut total_accrued: i128 = 0;
 
         for stream_id in stream_ids.iter() {
@@ -2790,6 +2912,17 @@ impl DonationVault {
                         .ok_or(Error::ArithmeticOverflow)?,
                 );
             }
+
+            // Accumulate the gross amount leaving the vault per token, so the
+            // committed balance can be reduced by exactly what was paid out
+            // (issue #346).
+            let gross_total = gross_payouts.get(stream.token.clone()).unwrap_or(0);
+            gross_payouts.set(
+                stream.token.clone(),
+                gross_total
+                    .checked_add(accrued)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            );
         }
 
         // Return NothingToWithdraw when no stream pays anything
@@ -2804,6 +2937,14 @@ impl DonationVault {
                 .ok_or(Error::ArithmeticOverflow)?;
         }
         record_outflow_totals(&env, total_accrued, total_fees)?;
+
+        // The gross amount per token is leaving the vault, so drop it from the
+        // committed balance before the transfers (issue #346).
+        for (token, gross) in gross_payouts.iter() {
+            if gross > 0 {
+                add_committed(&env, &token, -gross)?;
+            }
+        }
 
         // Every contributing stream shares one NGO (enforced above), so a
         // single resolution covers the whole batch. Withdrawals go to the
@@ -2928,6 +3069,9 @@ impl DonationVault {
         // External token transfer is the last step
         let token_client = token::Client::new(&env, &stream.token);
         if refund > 0 {
+            // `settle` already dropped the accrued payout from the committed
+            // balance; the refunded remainder leaves it here (issue #346).
+            add_committed(&env, &stream.token, -refund)?;
             token_client.transfer(&env.current_contract_address(), &stream.donor, &refund);
         }
 
@@ -3017,6 +3161,9 @@ impl DonationVault {
 
         let refund = stream.balance;
         if refund > 0 {
+            // The refunded remainder is no longer held for the stream, so it
+            // leaves the token's committed balance (issue #346).
+            add_committed(&env, &stream.token, -refund)?;
             let token_client = token::Client::new(&env, &stream.token);
             token_client.transfer(&env.current_contract_address(), &stream.donor, &refund);
         }
@@ -3137,6 +3284,10 @@ impl DonationVault {
         env.storage().persistent().set(&key, &stream);
         extend_instance_ttl(&env);
         extend_stream_ttl(&env, stream_id);
+
+        // The top-up joins this stream's share of the token's committed
+        // balance before it is pulled in (issue #346).
+        add_committed(&env, &stream.token, amount)?;
 
         // External token transfer is the last step
         token_client.transfer(&stream.donor, env.current_contract_address(), &amount);
@@ -3323,9 +3474,181 @@ impl DonationVault {
         Ok(())
     }
 
+    /// Reads the admin-configured upgrade timelock, in seconds. Zero means the
+    /// timelock is disabled and `upgrade` replaces the code immediately.
+    pub fn upgrade_delay(env: Env) -> u64 {
+        get_upgrade_delay(&env)
+    }
+
+    /// Reads the upgrade proposed by `propose_upgrade`, if one is awaiting its
+    /// timelock. `None` when nothing is pending.
+    pub fn pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage().instance().get(&DataKey::PendingUpgrade)
+    }
+
+    /// Reads the amount of `token` the vault holds on behalf of streams (the
+    /// sum of stream balances for that token). See issue #346.
+    pub fn committed_balance(env: Env, token: Address) -> i128 {
+        get_committed(&env, &token)
+    }
+
+    /// Reads how much of `token` the vault holds *above* its committed
+    /// balance — the surplus `sweep_surplus` is allowed to move. A token sent
+    /// to the vault by mistake surfaces here. See issue #346.
+    pub fn surplus(env: Env, token: Address) -> i128 {
+        let held = token::Client::new(&env, &token).balance(&env.current_contract_address());
+        held.saturating_sub(get_committed(&env, &token))
+    }
+
+    /// Sets how many seconds must pass between `propose_upgrade` and
+    /// `execute_upgrade`. Admin-gated; emits an `updelay` event. Setting it to
+    /// zero explicitly disables the timelock and re-enables the immediate
+    /// `upgrade` entry point.
+    pub fn set_upgrade_delay(env: Env, delay: u64) -> Result<(), Error> {
+        require_admin(&env)?;
+        env.storage().instance().set(&DataKey::UpgradeDelay, &delay);
+        extend_instance_ttl(&env);
+
+        UpgradeDelaySetEvent { delay }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Starts a timelocked upgrade by recording `new_wasm_hash` as pending, to
+    /// be carried out by `execute_upgrade` no earlier than the configured
+    /// `upgrade_delay` seconds from now. Admin-gated; emits an `uppropose`
+    /// event. Proposing again replaces any pending proposal and restarts the
+    /// timer.
+    pub fn propose_upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        require_admin(&env)?;
+        let delay = get_upgrade_delay(&env);
+        let executable_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(delay)
+            .ok_or(Error::ArithmeticOverflow)?;
+        env.storage().instance().set(
+            &DataKey::PendingUpgrade,
+            &PendingUpgrade {
+                new_wasm_hash: new_wasm_hash.clone(),
+                executable_at,
+            },
+        );
+        extend_instance_ttl(&env);
+
+        UpgradeProposedEvent {
+            new_wasm_hash,
+            executable_at,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Carries out the upgrade proposed by `propose_upgrade`, replacing the
+    /// contract's Wasm bytecode in place. Admin-gated; emits an `upgrade`
+    /// event. Fails with `NoPendingUpgrade` when nothing is proposed, and with
+    /// `UpgradeDelayNotElapsed` before the timelock has elapsed.
+    pub fn execute_upgrade(env: Env) -> Result<(), Error> {
+        require_admin(&env)?;
+        let pending: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .ok_or(Error::NoPendingUpgrade)?;
+        if env.ledger().timestamp() < pending.executable_at {
+            return Err(Error::UpgradeDelayNotElapsed);
+        }
+
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+        env.deployer()
+            .update_current_contract_wasm(pending.new_wasm_hash.clone());
+        extend_instance_ttl(&env);
+
+        UpgradedEvent {
+            new_wasm_hash: pending.new_wasm_hash,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Cancels the upgrade proposed by `propose_upgrade`. Admin-gated; emits
+    /// an `upcancel` event. Fails with `NoPendingUpgrade` when nothing is
+    /// proposed.
+    pub fn cancel_upgrade(env: Env) -> Result<(), Error> {
+        require_admin(&env)?;
+        let pending: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .ok_or(Error::NoPendingUpgrade)?;
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+        extend_instance_ttl(&env);
+
+        UpgradeCancelledEvent {
+            new_wasm_hash: pending.new_wasm_hash,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Sweeps tokens that were sent to the vault by mistake to the treasury.
+    ///
+    /// The vault's live balance of `token` is compared against the committed
+    /// balance it holds on behalf of streams (`committed_balance`); `amount`
+    /// may only cover the surplus above that, so a sweep can never dip into
+    /// funds belonging to streams. Admin-gated; emits a `sweep` event. Fails
+    /// with `NoTreasury` when no treasury is configured, with `InvalidAmount`
+    /// when `amount` is not positive, and with `SweepExceedsSurplus` when
+    /// `amount` exceeds the surplus.
+    pub fn sweep_surplus(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        require_admin(&env)?;
+        require_not_paused(&env)?;
+
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .ok_or(Error::NoTreasury)?;
+
+        let token_client = token::Client::new(&env, &token);
+        let held = token_client.balance(&env.current_contract_address());
+        // Anything held beyond the streams' committed balance is sweatable. A
+        // broken invariant (held below committed) leaves no surplus rather than
+        // underflowing, so a sweep is simply rejected.
+        let surplus = held.saturating_sub(get_committed(&env, &token));
+        if amount > surplus {
+            return Err(Error::SweepExceedsSurplus);
+        }
+
+        token_client.transfer(&env.current_contract_address(), &treasury, &amount);
+        extend_instance_ttl(&env);
+
+        SurplusSweptEvent {
+            token,
+            amount,
+            treasury,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
     /// Replaces the contract's Wasm bytecode in place. Admin-only.
     /// Lets a bug fix be deployed without changing the contract address,
     /// preserving every existing stream and configuration value.
+    ///
+    /// Only allowed while the upgrade timelock is explicitly disabled (the
+    /// configured `upgrade_delay` is zero). With a non-zero delay, upgrades
+    /// must go through `propose_upgrade` / `execute_upgrade` so donors holding
+    /// open streams get the warning period; this returns
+    /// `Error::UpgradeTimelockEnabled` otherwise.
     ///
     /// # Examples
     ///
@@ -3343,6 +3666,9 @@ impl DonationVault {
     /// ```
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         require_admin(&env)?;
+        if get_upgrade_delay(&env) != 0 {
+            return Err(Error::UpgradeTimelockEnabled);
+        }
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
         UpgradedEvent { new_wasm_hash }.publish(&env);

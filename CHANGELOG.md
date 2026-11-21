@@ -45,6 +45,21 @@ This project does not yet follow a formal versioning scheme — each contract's
 - `ngo-registry`: owner-gated `update_name` for fixing an application's
   name before approval; rejected with `Error::AlreadyVerified` after.
 - `ngo-registry`: read-only `ngo_count` getter for total registered NGOs.
+- `ngo-registry`: optional owner-controlled metadata URI on an NGO entry.
+  `set_metadata_uri` (owner-auth-gated) sets or clears it, `metadata_uri`
+  reads it back, and it is included in `get_ngo`'s `Ngo`. Bounded to
+  `MAX_METADATA_URI_LEN` (512 bytes); a longer value is rejected with
+  `Error::MetadataUriTooLong` (14). Emits a `metadata` event. Unlike the
+  name, it stays editable after approval, so an NGO's website/logo reference
+  can be kept current (#347).
+- `ngo-registry`: optional verification expiry. `set_verify_period` (admin)
+  sets a period in seconds that `approve_ngo` / `batch_approve` add to the
+  current time to stamp `Ngo.verified_until`; `verify_period` reads it back.
+  `renew_ngo` (admin) moves an entry's expiry forward from now. `is_verified`
+  and `get_ngo` treat a lapsed verification as unverified, while the stored
+  flag is kept so the entry can be renewed. A `renew` event carries the new
+  expiry and a `verperiod` event the new period; renewing with no period
+  configured fails with `Error::NoVerifyPeriod` (15) (#348).
 - Contract events for registry and vault state changes (see
   [`docs/EVENTS.md`](docs/EVENTS.md)).
 - Document storage TTL policy, inactivity expiry risks, and keep-alive entry
@@ -106,6 +121,34 @@ This project does not yet follow a formal versioning scheme — each contract's
   `approve_ngo` / `batch_approve` increment it, `revoke_ngo` decrements it, and
   removing an entry decrements it when the entry was verified. `ngo_count` is
   unchanged and still reports the total number of entries (#352).
+- `donation-vault`: two-step, timelocked upgrade. `set_upgrade_delay(delay)`
+  configures the warning period (admin-gated, emits `updelay`); `propose_upgrade`
+  records a pending Wasm hash plus its `executable_at` timestamp (admin-gated,
+  emits `uppropose`); `execute_upgrade` carries it out, emitting `upgrade`
+  (admin-gated, fails with `Error::NoPendingUpgrade` when nothing is proposed and
+  `Error::UpgradeDelayNotElapsed` before the delay); and `cancel_upgrade`
+  withdraws the proposal (admin-gated, emits `upcancel`, fails with
+  `Error::NoPendingUpgrade` when nothing is proposed). Read-only `upgrade_delay()`
+  and `pending_upgrade()` expose the configured delay and the pending proposal.
+  Donors holding open streams now get a warning window before the bytecode
+  changes (#343).
+- `donation-vault`: the vault now tracks a committed balance per token — the sum
+  of stream balances it holds on behalf of streams — kept in step by every
+  fund-moving path (`create_stream` / `top_up` add, `withdraw`,
+  `withdraw_batch`, `cancel_stream`, `rescue_stream`, `modify_rate`,
+  `pause_stream`, `resume_stream` and `transfer_stream` subtract). Admin-gated
+  `sweep_surplus(token, amount)` moves only the surplus above that committed
+  balance to the treasury, so tokens sent to the vault by mistake can be
+  recovered without ever touching stream funds; it emits `sweep` and fails with
+  `Error::NoTreasury` (no treasury configured) or
+  `Error::SweepExceedsSurplus` (more than the surplus). Read-only
+  `committed_balance()` and `surplus()` expose the two figures (#346).
+  Storage note: `DataKey::CommittedBalance` is a new key, so it is absent (zero)
+  on any pre-existing deployment. Upgrading a vault that already holds open
+  streams therefore requires a one-time backfill of each token's committed
+  balance (the sum of its streams' `balance`) before `sweep_surplus` is used, or
+  the whole token balance would read as sweepable surplus. No such deployment
+  exists yet, so no migration entry point is added.
 
 ### Changed
 
@@ -116,6 +159,14 @@ This project does not yet follow a formal versioning scheme — each contract's
   `revoke_ngo(approver: Address, ngo_owner: Address)`) and require the caller to
   be the admin or a listed approver. Integrators calling these entry points must
   pass the authorising address and update their invocation arguments (#349).
+- **BREAKING** `ngo-registry`: the `Ngo` struct gains a
+  `metadata_uri: Option<String>` field, so the value returned by `get_ngo`
+  changes shape. Off-chain decoders of `Ngo` must add the new field (#347).
+- **BREAKING** `ngo-registry`: the `Ngo` struct also gains a
+  `verified_until: Option<u64>` field, so `get_ngo`'s return shape changes
+  again. Off-chain decoders of `Ngo` must add the new field. Verification is
+  now time-bounded when a period is configured, and a lapsed verification is
+  reported by `get_ngo`/`is_verified` as unverified (#348).
 - **BREAKING** `donation-vault`: the `withdraw` event data payload now includes
   the payout destination, changing from `(accrued: i128, fee: i128, net: i128)`
   to `(accrued: i128, fee: i128, net: i128, payout: Address)`. Off-chain
@@ -149,6 +200,11 @@ This project does not yet follow a formal versioning scheme — each contract's
 - `donation-vault`: `create_stream` rejects a stream whose `donor` and `ngo`
   are the same address with `Error::SelfStream`, so a deposit can't be
   counted as a committed donation while streaming straight back to its donor.
+- `donation-vault`: the immediate `upgrade` entry point now refuses to run while
+  a non-zero `upgrade_delay` is configured, returning
+  `Error::UpgradeTimelockEnabled` instead. Upgrades must then go through
+  `propose_upgrade` / `execute_upgrade`; setting the delay back to zero via
+  `set_upgrade_delay(0)` explicitly re-enables the immediate path (#343).
 - Both contracts migrated event declarations from deprecated
   `Events::publish` to explicit `#[contractevent]` types. Topic names and
   positional payload formats are declared in code and documented in

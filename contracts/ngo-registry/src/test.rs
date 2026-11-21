@@ -175,6 +175,203 @@ fn update_name_accepts_name_at_max_length() {
     assert_eq!(client.get_ngo(&owner).name, at_limit);
 }
 
+// =============================================================================
+// metadata URI (issue #347)
+// =============================================================================
+
+#[test]
+fn register_defaults_metadata_uri_to_none() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    assert_eq!(client.get_ngo(&owner).metadata_uri, None);
+    assert_eq!(client.metadata_uri(&owner), None);
+}
+
+#[test]
+fn metadata_uri_getter_returns_none_for_unregistered_address() {
+    let (env, client, _admin) = setup();
+    let stranger = Address::generate(&env);
+
+    assert_eq!(client.metadata_uri(&stranger), None);
+}
+
+#[test]
+fn set_metadata_uri_stores_uri_and_publishes_event() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    let uri = Some(String::from_str(&env, "https://example.org/about"));
+    client.set_metadata_uri(&owner, &uri);
+
+    // Events cover only the latest top-level call, so assert before get_ngo.
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("metadata"), owner.clone()).into_val(&env),
+                uri.clone().into_val(&env),
+            ),
+        ]
+    );
+
+    assert_eq!(client.get_ngo(&owner).metadata_uri, uri);
+    assert_eq!(client.metadata_uri(&owner), uri);
+}
+
+#[test]
+fn set_metadata_uri_clears_with_none() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.set_metadata_uri(&owner, &Some(String::from_str(&env, "https://example.org")));
+
+    client.set_metadata_uri(&owner, &None);
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("metadata"), owner.clone()).into_val(&env),
+                None::<String>.into_val(&env),
+            ),
+        ]
+    );
+    assert_eq!(client.get_ngo(&owner).metadata_uri, None);
+    assert_eq!(client.metadata_uri(&owner), None);
+}
+
+#[test]
+fn set_metadata_uri_no_event_when_unchanged() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    let uri = Some(String::from_str(&env, "https://example.org"));
+    client.set_metadata_uri(&owner, &uri);
+
+    // Re-setting the same value writes nothing and emits nothing.
+    client.set_metadata_uri(&owner, &uri);
+
+    assert_eq!(env.events().all().events().len(), 0);
+}
+
+#[test]
+fn set_metadata_uri_accepts_uri_at_max_length() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    // Exactly MAX_METADATA_URI_LEN (512) bytes.
+    let at_limit = String::from_bytes(&env, &[b'a'; MAX_METADATA_URI_LEN as usize]);
+    client.set_metadata_uri(&owner, &Some(at_limit.clone()));
+
+    assert_eq!(client.get_ngo(&owner).metadata_uri, Some(at_limit));
+}
+
+#[test]
+fn set_metadata_uri_rejects_uri_over_max_length() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    // MAX_METADATA_URI_LEN (512) + 1 bytes.
+    let too_long = String::from_bytes(&env, &[b'a'; MAX_METADATA_URI_LEN as usize + 1]);
+    let result = client.try_set_metadata_uri(&owner, &Some(too_long));
+
+    assert_eq!(result, Err(Ok(Error::MetadataUriTooLong)));
+    // The entry is left untouched.
+    assert_eq!(client.get_ngo(&owner).metadata_uri, None);
+}
+
+#[test]
+fn set_metadata_uri_for_unregistered_ngo_fails() {
+    let (env, client, _admin) = setup();
+    let stranger = Address::generate(&env);
+
+    let result = client.try_set_metadata_uri(
+        &stranger,
+        &Some(String::from_str(&env, "https://example.org")),
+    );
+
+    assert_eq!(result, Err(Ok(Error::NotRegistered)));
+}
+
+#[test]
+fn set_metadata_uri_requires_owner_auth() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    client.set_metadata_uri(&owner, &Some(String::from_str(&env, "https://example.org")));
+
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1);
+    let (address, invocation) = &auths[0];
+    assert_eq!(address, &owner);
+    match &invocation.function {
+        AuthorizedFunction::Contract((contract, function, _)) => {
+            assert_eq!(contract, &client.address);
+            assert_eq!(function, &Symbol::new(&env, "set_metadata_uri"));
+        }
+        _ => panic!("expected a contract invocation"),
+    }
+}
+
+#[test]
+fn set_metadata_uri_remains_allowed_after_approval() {
+    let (env, client, admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+
+    // Unlike the name, the metadata URI is not frozen by verification.
+    let uri = Some(String::from_str(&env, "https://example.org/logo.svg"));
+    client.set_metadata_uri(&owner, &uri);
+
+    let ngo = client.get_ngo(&owner);
+    assert!(ngo.verified);
+    assert_eq!(ngo.metadata_uri, uri);
+}
+
+#[test]
+fn set_metadata_uri_bumps_instance_and_ngo_ttl() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    age_past_thresholds(&env, &client, &owner);
+
+    client.set_metadata_uri(&owner, &Some(String::from_str(&env, "https://example.org")));
+
+    assert_ttls_bumped(&env, &client, &owner);
+}
+
+#[test]
+fn get_ngo_includes_metadata_uri() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    let name = String::from_str(&env, "Red Cross");
+    client.register(&owner, &name);
+    let uri = Some(String::from_str(&env, "https://example.org"));
+    client.set_metadata_uri(&owner, &uri);
+
+    assert_eq!(
+        client.get_ngo(&owner),
+        Ngo {
+            owner: owner.clone(),
+            name,
+            verified: false,
+            metadata_uri: uri,
+            verified_until: None,
+        }
+    );
+}
+
 #[test]
 fn register_and_update_name_unicode_whitespace_only_fails() {
     let (env, client, _admin) = setup();
@@ -776,6 +973,8 @@ fn update_name_changes_name_before_approval() {
             owner: owner.clone(),
             name: fixed.clone(),
             verified: false,
+            metadata_uri: None,
+            verified_until: None,
         }
     );
 }
@@ -831,6 +1030,8 @@ fn update_name_after_revocation_succeeds() {
             owner: owner.clone(),
             name: fixed,
             verified: false,
+            metadata_uri: None,
+            verified_until: None,
         }
     );
 }
@@ -1424,6 +1625,233 @@ fn removing_a_verified_ngo_is_rejected_and_leaves_count_unchanged() {
         Err(Ok(Error::AlreadyVerified))
     );
     assert_eq!(client.verified_count(), 1);
+}
+
+// =============================================================================
+// verification expiry and renewal (issue #348)
+// =============================================================================
+
+#[test]
+fn verify_period_defaults_to_zero() {
+    let (_env, client, _admin) = setup();
+    assert_eq!(client.verify_period(), 0);
+}
+
+#[test]
+fn set_verify_period_stores_value_and_emits_event() {
+    let (env, client, _admin) = setup();
+    let period = 1_000u64;
+    client.set_verify_period(&period);
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("verperiod"),).into_val(&env),
+                period.into_val(&env),
+            ),
+        ]
+    );
+    assert_eq!(client.verify_period(), period);
+}
+
+#[test]
+fn set_verify_period_requires_admin_auth() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+
+    assert_sole_auth(&env, &client, &admin, "set_verify_period");
+}
+
+#[test]
+fn set_verify_period_does_not_change_existing_approvals() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+    assert_eq!(client.get_ngo(&owner).verified_until, Some(1_000));
+
+    // Raising the period only affects future approvals and renewals.
+    client.set_verify_period(&5_000);
+    assert_eq!(client.get_ngo(&owner).verified_until, Some(1_000));
+}
+
+#[test]
+fn approve_without_period_never_expires() {
+    let (env, client, admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+
+    assert_eq!(client.get_ngo(&owner).verified_until, None);
+    assert!(client.is_verified(&owner));
+
+    // Without a period the verification is permanent, however far time moves.
+    env.ledger().with_mut(|l| l.timestamp = 10_000_000);
+    assert!(client.is_verified(&owner));
+}
+
+#[test]
+fn approve_stamps_verified_until_from_period() {
+    let (env, client, admin) = setup();
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    client.set_verify_period(&500);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+
+    assert_eq!(client.get_ngo(&owner).verified_until, Some(1_500));
+}
+
+#[test]
+fn is_verified_holds_until_the_boundary_then_lapses() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+    assert_eq!(client.get_ngo(&owner).verified_until, Some(1_000));
+
+    // One second before the expiry the entry is still verified.
+    env.ledger().with_mut(|l| l.timestamp = 999);
+    assert!(client.is_verified(&owner));
+
+    // At the expiry exactly, and after it, it is treated as unverified.
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    assert!(!client.is_verified(&owner));
+    env.ledger().with_mut(|l| l.timestamp = 1_001);
+    assert!(!client.is_verified(&owner));
+}
+
+#[test]
+fn get_ngo_reports_unverified_after_expiry() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+
+    let ngo = client.get_ngo(&owner);
+    assert!(!ngo.verified);
+    // The stored expiry is kept so an admin can still renew the entry.
+    assert_eq!(ngo.verified_until, Some(1_000));
+}
+
+#[test]
+fn renew_ngo_revives_a_lapsed_verification_and_emits_event() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+
+    // Time moves well past the original expiry.
+    env.ledger().with_mut(|l| l.timestamp = 4_000);
+    assert!(!client.is_verified(&owner));
+
+    client.renew_ngo(&owner);
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("renew"), owner.clone()).into_val(&env),
+                5_000u64.into_val(&env),
+            ),
+        ]
+    );
+    assert!(client.is_verified(&owner));
+    assert_eq!(client.get_ngo(&owner).verified_until, Some(5_000));
+}
+
+#[test]
+fn renew_ngo_requires_admin_auth() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+
+    client.renew_ngo(&owner);
+
+    assert_sole_auth(&env, &client, &admin, "renew_ngo");
+}
+
+#[test]
+fn renew_ngo_for_unregistered_ngo_fails() {
+    let (env, client, _admin) = setup();
+    client.set_verify_period(&1_000);
+    let random = Address::generate(&env);
+
+    assert_eq!(client.try_renew_ngo(&random), Err(Ok(Error::NotRegistered)));
+}
+
+#[test]
+fn renew_ngo_for_unapproved_ngo_fails() {
+    let (env, client, _admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    assert_eq!(client.try_renew_ngo(&owner), Err(Ok(Error::NotVerified)));
+}
+
+#[test]
+fn renew_ngo_without_configured_period_fails() {
+    let (env, client, admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+
+    // No period is configured, so there is no expiry to extend.
+    assert_eq!(client.try_renew_ngo(&owner), Err(Ok(Error::NoVerifyPeriod)));
+}
+
+#[test]
+fn renew_ngo_after_revoke_fails() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+    client.revoke_ngo(&admin, &owner);
+
+    assert_eq!(client.try_renew_ngo(&owner), Err(Ok(Error::NotVerified)));
+}
+
+#[test]
+fn revoke_clears_verified_until() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+    assert_eq!(client.get_ngo(&owner).verified_until, Some(1_000));
+
+    client.revoke_ngo(&admin, &owner);
+
+    assert_eq!(client.get_ngo(&owner).verified_until, None);
+}
+
+#[test]
+fn renew_ngo_bumps_instance_and_ngo_ttl() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+    age_past_thresholds(&env, &client, &owner);
+
+    client.renew_ngo(&owner);
+
+    assert_ttls_bumped(&env, &client, &owner);
 }
 
 // =============================================================================
