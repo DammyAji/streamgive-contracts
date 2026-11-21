@@ -22,7 +22,8 @@ layout stable. Event type names include `RegisterEvent`, `RenamedEvent`,
 `MinDepositSetEvent`, `CancelGraceLedgersSetEvent`, `RegistrySetEvent`,
 `PayoutAddressSetEvent`, `MaxStreamsPerDonorSetEvent`, `MaxRateSetEvent`,
 `MaxRateClearedEvent`, `InitializedEvent`,
-`UpgradedEvent`, `ApproverAddedEvent`, `ApproverRemovedEvent`,
+`UpgradedEvent`, `UpgradeProposedEvent`, `UpgradeCancelledEvent`,
+`UpgradeDelaySetEvent`, `ApproverAddedEvent`, `ApproverRemovedEvent`,
 `CreatedEvent`, `WithdrawnEvent`, `CancelledStreamEvent`, `RescuedStreamEvent`,
 `ToppedUpEvent`, and `RateModifiedEvent`.
 
@@ -372,12 +373,55 @@ polling `payout_address`.
 
 ### `upgrade`
 
-Emitted by `upgrade` when an admin replaces the vault's Wasm bytecode.
+Emitted by `upgrade` and by `execute_upgrade` when an admin replaces the
+vault's Wasm bytecode.
 
 | | |
 |---|---|
 | Topics | `("upgrade",)` |
 | Data | `new_wasm_hash: BytesN<32>` |
+
+`upgrade` only publishes this while the upgrade timelock is disabled (a
+configured `upgrade_delay` of zero). With a non-zero delay it returns
+`Error::UpgradeTimelockEnabled`, and the code change happens through
+`execute_upgrade` instead (#343).
+
+### `uppropose`
+
+Emitted by `propose_upgrade` when an admin records the Wasm hash to upgrade to
+and the timestamp from which the upgrade may be executed.
+
+| | |
+|---|---|
+| Topics | `("uppropose", new_wasm_hash: BytesN<32>)` |
+| Data | `executable_at: u64` |
+
+`executable_at` is the ledger timestamp before which `execute_upgrade` returns
+`Error::UpgradeDelayNotElapsed`. Proposing again replaces any pending proposal
+and restarts the timer (#343).
+
+### `upcancel`
+
+Emitted by `cancel_upgrade` when an admin withdraws a pending proposal before
+it is executed.
+
+| | |
+|---|---|
+| Topics | `("upcancel",)` |
+| Data | `new_wasm_hash: BytesN<32>` |
+
+The hash is the one that was pending, so an indexer can correlate the
+cancellation with the earlier `uppropose` (#343).
+
+### `updelay`
+
+Emitted by `set_upgrade_delay` when an admin changes how long the upgrade
+timelock lasts.
+
+| | |
+|---|---|
+| Topics | `("updelay",)` |
+| Data | `delay: u64` (the new delay in seconds; `0` disables the timelock) |
 
 ### `created`
 

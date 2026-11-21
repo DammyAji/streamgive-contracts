@@ -106,6 +106,17 @@ This project does not yet follow a formal versioning scheme — each contract's
   `approve_ngo` / `batch_approve` increment it, `revoke_ngo` decrements it, and
   removing an entry decrements it when the entry was verified. `ngo_count` is
   unchanged and still reports the total number of entries (#352).
+- `donation-vault`: two-step, timelocked upgrade. `set_upgrade_delay(delay)`
+  configures the warning period (admin-gated, emits `updelay`); `propose_upgrade`
+  records a pending Wasm hash plus its `executable_at` timestamp (admin-gated,
+  emits `uppropose`); `execute_upgrade` carries it out, emitting `upgrade`
+  (admin-gated, fails with `Error::NoPendingUpgrade` when nothing is proposed and
+  `Error::UpgradeDelayNotElapsed` before the delay); and `cancel_upgrade`
+  withdraws the proposal (admin-gated, emits `upcancel`, fails with
+  `Error::NoPendingUpgrade` when nothing is proposed). Read-only `upgrade_delay()`
+  and `pending_upgrade()` expose the configured delay and the pending proposal.
+  Donors holding open streams now get a warning window before the bytecode
+  changes (#343).
 
 ### Changed
 
@@ -149,6 +160,11 @@ This project does not yet follow a formal versioning scheme — each contract's
 - `donation-vault`: `create_stream` rejects a stream whose `donor` and `ngo`
   are the same address with `Error::SelfStream`, so a deposit can't be
   counted as a committed donation while streaming straight back to its donor.
+- `donation-vault`: the immediate `upgrade` entry point now refuses to run while
+  a non-zero `upgrade_delay` is configured, returning
+  `Error::UpgradeTimelockEnabled` instead. Upgrades must then go through
+  `propose_upgrade` / `execute_upgrade`; setting the delay back to zero via
+  `set_upgrade_delay(0)` explicitly re-enables the immediate path (#343).
 - Both contracts migrated event declarations from deprecated
   `Events::publish` to explicit `#[contractevent]` types. Topic names and
   positional payload formats are declared in code and documented in

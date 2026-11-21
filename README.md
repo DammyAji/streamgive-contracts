@@ -87,8 +87,8 @@ keep-alive, continues to work. The table below lists every public entry point.
 | `init`, `__constructor` | **Works** during setup; neither has a pause gate (the vault cannot be paused before it is initialised) |
 | `propose_admin`, `accept_admin`, `cancel_admin_proposal` | **Work** — admin handshake is not paused |
 | `set_treasury`, `clear_treasury`, `set_fee_bps`, `set_token_fee_bps`, `clear_token_fee_bps` | **Work** — admin-gated configuration; no pause gate |
-| `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_max_rate`, `clear_max_rate`, `set_registry`, `clear_registry`, `upgrade` | **Work** — admin-gated configuration; no pause gate |
-| `total_donated`, `admin`, `pending_admin`, `get_stream`, `streams_by_donor`, `stream_count`, `pending_accrual`, `depletion_time`, `pending_payout`, `paused`, `get_config`, `treasury`, `fee_bps`, `max_fee_bps`, `token_fee_bps`, `allowed_tokens`, `min_deposit`, `cancel_grace_ledgers`, `max_streams_per_donor`, `max_rate`, `registry`, `payout_address` | **Work** — read-only views are never paused |
+| `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_max_rate`, `clear_max_rate`, `set_registry`, `clear_registry`, `upgrade`, `set_upgrade_delay`, `propose_upgrade`, `execute_upgrade`, `cancel_upgrade` | **Work** — admin-gated configuration; no pause gate |
+| `total_donated`, `admin`, `pending_admin`, `get_stream`, `streams_by_donor`, `stream_count`, `pending_accrual`, `depletion_time`, `pending_payout`, `paused`, `get_config`, `treasury`, `fee_bps`, `max_fee_bps`, `token_fee_bps`, `allowed_tokens`, `min_deposit`, `cancel_grace_ledgers`, `max_streams_per_donor`, `max_rate`, `registry`, `payout_address`, `upgrade_delay`, `pending_upgrade` | **Work** — read-only views are never paused |
 
 Pausing does **not** stop time-based accrual. A stream's `pending_accrual`
 keeps growing while the vault is paused, so a stream paused for a week still
@@ -308,7 +308,7 @@ currently allocated up to code 33. See [docs/UPGRADE_POLICY.md](docs/UPGRADE_POL
 | Code | Error | Meaning | Entry points |
 | --- | --- | --- | --- |
 | 1 | `AlreadyInitialized` | `init` already created an admin. | `init` |
-| 2 | `NotInitialized` | No admin is stored. | `admin`, `propose_admin`, `cancel_admin_proposal`, `pause`, `unpause`, `set_treasury`, `clear_treasury`, `set_fee_bps`, `set_token_fee_bps`, `clear_token_fee_bps`, `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_registry`, `renounce_admin`, `rescue_stream`, `upgrade` |
+| 2 | `NotInitialized` | No admin is stored. | `admin`, `propose_admin`, `cancel_admin_proposal`, `pause`, `unpause`, `set_treasury`, `clear_treasury`, `set_fee_bps`, `set_token_fee_bps`, `clear_token_fee_bps`, `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_registry`, `renounce_admin`, `rescue_stream`, `upgrade`, `set_upgrade_delay`, `propose_upgrade`, `execute_upgrade`, `cancel_upgrade` |
 | 3 | `StreamNotFound` | No stream exists for the id. | `get_stream`, `pending_accrual`, `depletion_time`, `pending_payout`, `extend_stream`, `withdraw`, `withdraw_batch`, `cancel_stream`, `rescue_stream`, `top_up`, `modify_rate`, `transfer_stream` |
 | 4 | `InvalidAmount` | A deposit, rate, top-up, rate change, or minimum deposit was zero/negative (or a fee would swallow the first payout). | `create_stream`, `create_stream_with_start`, `create_stream_with_memo`, `top_up`, `modify_rate`, `set_min_deposit` |
 | 5 | `NothingToWithdraw` | The stream accrued nothing since its last checkpoint. | `withdraw` |
@@ -326,7 +326,7 @@ currently allocated up to code 33. See [docs/UPGRADE_POLICY.md](docs/UPGRADE_POL
 | 17 | `StreamLimitExceeded` | Donor reached `max_streams_per_donor`. | `create_stream`, `create_stream_with_start`, `create_stream_with_memo` |
 | 18 | `NgoNotVerified` | A configured registry has no verified entry for the NGO. | `create_stream`, `create_stream_with_start`, `create_stream_with_memo`, `top_up`, `transfer_stream`, `modify_rate` (rate increases only) |
 | 19 | `StreamCounterMissing` | The stream-id counter is absent from instance storage. | `create_stream`, `create_stream_with_start`, `create_stream_with_memo` |
-| 20 | `AdminRenounced` | Admin control was permanently renounced, or `init` ran after a renounce. | `init`, `admin`, `propose_admin`, `cancel_admin_proposal`, `pause`, `unpause`, `set_treasury`, `clear_treasury`, `set_fee_bps`, `set_token_fee_bps`, `clear_token_fee_bps`, `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_registry`, `renounce_admin`, `rescue_stream`, `upgrade` |
+| 20 | `AdminRenounced` | Admin control was permanently renounced, or `init` ran after a renounce. | `init`, `admin`, `propose_admin`, `cancel_admin_proposal`, `pause`, `unpause`, `set_treasury`, `clear_treasury`, `set_fee_bps`, `set_token_fee_bps`, `clear_token_fee_bps`, `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_registry`, `renounce_admin`, `rescue_stream`, `upgrade`, `set_upgrade_delay`, `propose_upgrade`, `execute_upgrade`, `cancel_upgrade` |
 | 21 | `FeeRequiresTreasury` | A non-zero fee was set with no treasury, or the treasury was cleared while a fee is set. | `set_fee_bps`, `set_token_fee_bps`, `clear_treasury` |
 | 22 | `NotPaused` | `rescue_stream` called while the vault is active. | `rescue_stream` |
 | 23 | `MixedNgo` | A batch withdrawal mixed streams belonging to different NGOs. | `withdraw_batch` |
@@ -340,6 +340,9 @@ currently allocated up to code 33. See [docs/UPGRADE_POLICY.md](docs/UPGRADE_POL
 | 31 | `MemoTooLong` | `create_stream_with_memo` was given a `memo` longer than `MAX_MEMO_BYTES` (32) bytes. | `create_stream_with_memo` |
 | 32 | `StreamAlreadyPaused` | `pause_stream` called on a stream that is already paused. | `pause_stream` |
 | 33 | `StreamNotPaused` | `resume_stream` called on a stream that is not paused. | `resume_stream` |
+| 34 | `NoPendingUpgrade` | `execute_upgrade` or `cancel_upgrade` was called with no upgrade proposed. | `execute_upgrade`, `cancel_upgrade` |
+| 35 | `UpgradeDelayNotElapsed` | `execute_upgrade` was called before the proposed upgrade's timelock elapsed. | `execute_upgrade` |
+| 36 | `UpgradeTimelockEnabled` | The immediate `upgrade` entry point was called while a non-zero `upgrade_delay` is configured. | `upgrade` |
 
 ### `ngo-registry`
 

@@ -3880,6 +3880,195 @@ fn upgrade_preserves_state() {
 }
 
 // =============================================================================
+// timelocked upgrade (issue #343)
+// =============================================================================
+
+#[test]
+fn set_upgrade_delay_configures_timelock_and_publishes_event() {
+    let s = setup();
+
+    assert_eq!(s.client.upgrade_delay(), 0);
+
+    s.client.set_upgrade_delay(&3_600);
+
+    assert_last_event(&s.env, (symbol_short!("updelay"),), 3_600u64);
+    assert_eq!(s.client.upgrade_delay(), 3_600);
+}
+
+#[test]
+fn set_upgrade_delay_zero_disables_timelock() {
+    let s = setup();
+
+    s.client.set_upgrade_delay(&3_600);
+    s.client.set_upgrade_delay(&0);
+
+    assert_eq!(s.client.upgrade_delay(), 0);
+}
+
+#[test]
+fn set_upgrade_delay_requires_admin() {
+    let s = setup();
+
+    s.env.mock_auths(&[]);
+    assert!(s.client.try_set_upgrade_delay(&3_600).is_err());
+}
+
+#[test]
+fn propose_upgrade_records_pending_and_publishes_event() {
+    let s = setup();
+    s.env.ledger().with_mut(|l| l.timestamp = 1_000);
+    s.client.set_upgrade_delay(&3_600);
+    let new_wasm_hash = BytesN::from_array(&s.env, &[7u8; 32]);
+
+    s.client.propose_upgrade(&new_wasm_hash);
+
+    // The event buffer is cleared by the next top-level call, so read it first.
+    assert_last_event(
+        &s.env,
+        (symbol_short!("uppropose"), new_wasm_hash.clone()),
+        4_600u64,
+    );
+
+    let pending = s.client.pending_upgrade().expect("a proposal is pending");
+    assert_eq!(pending.new_wasm_hash, new_wasm_hash);
+    assert_eq!(pending.executable_at, 4_600);
+}
+
+#[test]
+fn propose_upgrade_replaces_previous_proposal() {
+    let s = setup();
+    s.env.ledger().with_mut(|l| l.timestamp = 1_000);
+    s.client.set_upgrade_delay(&1_000);
+    let first = BytesN::from_array(&s.env, &[1u8; 32]);
+    let second = BytesN::from_array(&s.env, &[2u8; 32]);
+
+    s.client.propose_upgrade(&first);
+    s.env.ledger().with_mut(|l| l.timestamp = 1_500);
+    s.client.propose_upgrade(&second);
+
+    let pending = s.client.pending_upgrade().expect("a proposal is pending");
+    assert_eq!(pending.new_wasm_hash, second);
+    assert_eq!(pending.executable_at, 2_500);
+}
+
+#[test]
+fn propose_upgrade_requires_admin() {
+    let s = setup();
+    let new_wasm_hash = BytesN::from_array(&s.env, &[7u8; 32]);
+
+    s.env.mock_auths(&[]);
+    assert!(s.client.try_propose_upgrade(&new_wasm_hash).is_err());
+}
+
+#[test]
+fn execute_upgrade_before_delay_elapsed_fails() {
+    let s = setup();
+    s.env.ledger().with_mut(|l| l.timestamp = 1_000);
+    s.client.set_upgrade_delay(&3_600);
+    let new_wasm_hash = s.env.deployer().upload_contract_wasm(Bytes::new(&s.env));
+
+    s.client.propose_upgrade(&new_wasm_hash);
+
+    let result = s.client.try_execute_upgrade();
+    assert_eq!(result, Err(Ok(Error::UpgradeDelayNotElapsed)));
+}
+
+#[test]
+fn execute_upgrade_after_delay_elapsed_succeeds() {
+    let s = setup();
+    s.env.ledger().with_mut(|l| l.timestamp = 1_000);
+    s.client.set_upgrade_delay(&3_600);
+    let new_wasm_hash = s.env.deployer().upload_contract_wasm(Bytes::new(&s.env));
+
+    s.client.propose_upgrade(&new_wasm_hash);
+    s.env.ledger().with_mut(|l| l.timestamp = 4_600);
+
+    s.client.execute_upgrade();
+
+    assert_last_event(&s.env, (symbol_short!("upgrade"),), new_wasm_hash.clone());
+    assert!(s.client.pending_upgrade().is_none());
+}
+
+#[test]
+fn execute_upgrade_without_proposal_fails() {
+    let s = setup();
+
+    let result = s.client.try_execute_upgrade();
+    assert_eq!(result, Err(Ok(Error::NoPendingUpgrade)));
+}
+
+#[test]
+fn execute_upgrade_requires_admin() {
+    let s = setup();
+    s.env.ledger().with_mut(|l| l.timestamp = 1_000);
+    s.client.set_upgrade_delay(&1);
+    let new_wasm_hash = s.env.deployer().upload_contract_wasm(Bytes::new(&s.env));
+    s.client.propose_upgrade(&new_wasm_hash);
+    s.env.ledger().with_mut(|l| l.timestamp = 1_001);
+
+    s.env.mock_auths(&[]);
+    assert!(s.client.try_execute_upgrade().is_err());
+}
+
+#[test]
+fn cancel_upgrade_clears_pending_and_publishes_event() {
+    let s = setup();
+    s.env.ledger().with_mut(|l| l.timestamp = 1_000);
+    s.client.set_upgrade_delay(&3_600);
+    let new_wasm_hash = BytesN::from_array(&s.env, &[9u8; 32]);
+
+    s.client.propose_upgrade(&new_wasm_hash);
+
+    s.client.cancel_upgrade();
+
+    assert_last_event(&s.env, (symbol_short!("upcancel"),), new_wasm_hash.clone());
+    assert!(s.client.pending_upgrade().is_none());
+}
+
+#[test]
+fn cancel_upgrade_without_proposal_fails() {
+    let s = setup();
+
+    let result = s.client.try_cancel_upgrade();
+    assert_eq!(result, Err(Ok(Error::NoPendingUpgrade)));
+}
+
+#[test]
+fn cancel_upgrade_requires_admin() {
+    let s = setup();
+    s.env.ledger().with_mut(|l| l.timestamp = 1_000);
+    s.client.set_upgrade_delay(&3_600);
+    let new_wasm_hash = BytesN::from_array(&s.env, &[9u8; 32]);
+    s.client.propose_upgrade(&new_wasm_hash);
+
+    s.env.mock_auths(&[]);
+    assert!(s.client.try_cancel_upgrade().is_err());
+}
+
+#[test]
+fn upgrade_rejected_while_timelock_enabled() {
+    let s = setup();
+    s.client.set_upgrade_delay(&3_600);
+    let new_wasm_hash = s.env.deployer().upload_contract_wasm(Bytes::new(&s.env));
+
+    let result = s.client.try_upgrade(&new_wasm_hash);
+    assert_eq!(result, Err(Ok(Error::UpgradeTimelockEnabled)));
+}
+
+#[test]
+fn upgrade_allowed_once_timelock_disabled() {
+    let s = setup();
+    s.client.set_upgrade_delay(&3_600);
+    // Explicitly disabling the timelock re-enables the immediate path.
+    s.client.set_upgrade_delay(&0);
+    let new_wasm_hash = s.env.deployer().upload_contract_wasm(Bytes::new(&s.env));
+
+    s.client.upgrade(&new_wasm_hash);
+
+    assert_last_event(&s.env, (symbol_short!("upgrade"),), new_wasm_hash.clone());
+}
+
+// =============================================================================
 // rescue_stream tests (issue #286)
 // =============================================================================
 
