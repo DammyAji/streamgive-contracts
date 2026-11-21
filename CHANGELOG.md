@@ -96,6 +96,16 @@ This project does not yet follow a formal versioning scheme — each contract's
   by the admin or a listed approver (`Error::NotApprover` otherwise), and it
   rejects an already-verified NGO with `Error::AlreadyVerified` — an approval is
   undone with `revoke_ngo` first (#350).
+- `ngo-registry`: `list_ngos_page(start, limit)` returns a page of owner
+  addresses alongside `next`, the index to resume from, so clients can page
+  through the registry without recomputing the cursor and can tell the final
+  page from a full one. `list_ngos` is unchanged (#351).
+- `ngo-registry`: `verified_count()` getter so dashboards can read the number of
+  verified NGOs without listing the registry. The count is backed by a
+  `DataKey::VerifiedCount` instance key kept in step by every transition:
+  `approve_ngo` / `batch_approve` increment it, `revoke_ngo` decrements it, and
+  removing an entry decrements it when the entry was verified. `ngo_count` is
+  unchanged and still reports the total number of entries (#352).
 
 ### Changed
 
