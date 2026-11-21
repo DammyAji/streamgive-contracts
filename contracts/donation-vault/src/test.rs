@@ -3570,7 +3570,7 @@ fn transfer_stream_rejects_unverified_new_ngo_when_registry_configured() {
     s.token_admin.mint(&s.donor, &1_000);
 
     registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Old NGO"));
-    registry.approve_ngo(&s.ngo);
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
 
     let stream_id = s
         .client
@@ -3583,7 +3583,7 @@ fn transfer_stream_rejects_unverified_new_ngo_when_registry_configured() {
 
     // Now register and approve new_ngo
     registry.register(&new_ngo, &soroban_sdk::String::from_str(&s.env, "New NGO"));
-    registry.approve_ngo(&new_ngo);
+    registry.approve_ngo(&s.client.admin(), &new_ngo);
     assert_eq!(
         s.client.try_transfer_stream(&stream_id, &new_ngo),
         Ok(Ok(()))
@@ -4118,7 +4118,7 @@ fn create_stream_succeeds_for_verified_ngo() {
     s.token_admin.mint(&s.donor, &1_000);
 
     registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
-    registry.approve_ngo(&s.ngo);
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
 
     let stream_id = s
         .client
@@ -4165,8 +4165,8 @@ fn create_stream_fails_for_revoked_ngo() {
 
     // Register, approve, then revoke
     registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
-    registry.approve_ngo(&s.ngo);
-    registry.revoke_ngo(&s.ngo);
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
+    registry.revoke_ngo(&s.client.admin(), &s.ngo);
 
     let result = s
         .client
@@ -4310,7 +4310,7 @@ fn valid_registry_can_be_set_again_after_clearing() {
 
     // Approve NGO and succeed
     registry_client.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
-    registry_client.approve_ngo(&s.ngo);
+    registry_client.approve_ngo(&s.client.admin(), &s.ngo);
     let stream_id = s
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
@@ -4323,7 +4323,7 @@ fn top_up_to_verified_ngo_works_with_registry_configured() {
     s.token_admin.mint(&s.donor, &3_000);
 
     registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
-    registry.approve_ngo(&s.ngo);
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
 
     let stream_id = s
         .client
@@ -4340,14 +4340,14 @@ fn top_up_after_revocation_fails_and_preserves_state() {
     s.token_admin.mint(&s.donor, &3_000);
 
     registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
-    registry.approve_ngo(&s.ngo);
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
 
     let stream_id = s
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
 
     // Revoke the NGO
-    registry.revoke_ngo(&s.ngo);
+    registry.revoke_ngo(&s.client.admin(), &s.ngo);
 
     let donor_balance_before = s.token.balance(&s.donor);
     let stream_balance_before = s.client.get_stream(&stream_id).balance;
@@ -4386,21 +4386,21 @@ fn top_up_after_re_verification_succeeds() {
     s.token_admin.mint(&s.donor, &3_000);
 
     registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
-    registry.approve_ngo(&s.ngo);
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
 
     let stream_id = s
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
 
     // Revoke and verify top_up fails
-    registry.revoke_ngo(&s.ngo);
+    registry.revoke_ngo(&s.client.admin(), &s.ngo);
     assert_eq!(
         s.client.try_top_up(&stream_id, &500),
         Err(Ok(Error::NgoNotVerified))
     );
 
     // Re-verify the NGO
-    registry.approve_ngo(&s.ngo);
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
 
     // Top up now succeeds
     s.client.top_up(&stream_id, &500);
@@ -4414,14 +4414,14 @@ fn cancel_and_withdraw_still_work_for_stream_whose_ngo_was_revoked() {
     s.token_admin.mint(&s.donor, &2_000);
 
     registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
-    registry.approve_ngo(&s.ngo);
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
 
     let stream_id = s
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
 
     // Revoke NGO after stream opened
-    registry.revoke_ngo(&s.ngo);
+    registry.revoke_ngo(&s.client.admin(), &s.ngo);
 
     // Advance 20 seconds: 20 * 10 = 200 accrued
     s.env.ledger().with_mut(|l| l.timestamp += 20);
@@ -4470,13 +4470,13 @@ fn modify_rate_increase_for_revoked_ngo_fails_and_preserves_state() {
     s.token_admin.mint(&s.donor, &1_000);
 
     registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
-    registry.approve_ngo(&s.ngo);
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
 
     let stream_id = s
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
 
-    registry.revoke_ngo(&s.ngo);
+    registry.revoke_ngo(&s.client.admin(), &s.ngo);
     s.env.ledger().with_mut(|l| l.timestamp += 10);
 
     let before = s.client.get_stream(&stream_id);
@@ -4496,13 +4496,13 @@ fn modify_rate_decrease_for_revoked_ngo_succeeds() {
     s.token_admin.mint(&s.donor, &1_000);
 
     registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
-    registry.approve_ngo(&s.ngo);
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
 
     let stream_id = s
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
 
-    registry.revoke_ngo(&s.ngo);
+    registry.revoke_ngo(&s.client.admin(), &s.ngo);
     s.env.ledger().with_mut(|l| l.timestamp += 10); // 100 accrues at the old rate
 
     s.client.modify_rate(&stream_id, &5);
@@ -4519,7 +4519,7 @@ fn modify_rate_increase_for_verified_ngo_succeeds() {
     s.token_admin.mint(&s.donor, &1_000);
 
     registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
-    registry.approve_ngo(&s.ngo);
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
 
     let stream_id = s
         .client

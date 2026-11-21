@@ -151,8 +151,10 @@ The following table summarizes all entry points that automatically bump storage 
 | `donation-vault` | `cancel_stream` | Instance (30d), `Stream(id)` (90d + `cancel_grace_ledgers`) | Donor |
 | `donation-vault` | `extend_stream` | `Stream(id)` (90d) | **None (Permissionless)** |
 | `ngo-registry` | `register` | Instance (30d), `Ngo(owner)` (90d) | Owner |
-| `ngo-registry` | `approve_ngo` | Instance (30d), `Ngo(owner)` (90d) | Admin |
-| `ngo-registry` | `revoke_ngo` | Instance (30d), `Ngo(owner)` (90d) | Admin |
+| `ngo-registry` | `approve_ngo` | Instance (30d), `Ngo(owner)` (90d) | Admin or approver |
+| `ngo-registry` | `revoke_ngo` | Instance (30d), `Ngo(owner)` (90d) | Admin or approver |
+| `ngo-registry` | `add_approver` | Instance (30d) | Admin |
+| `ngo-registry` | `remove_approver` | Instance (30d) | Admin |
 | `ngo-registry` | `update_name` | Instance (30d), `Ngo(owner)` (90d) | Owner |
 | `ngo-registry` | `touch_ngo` | Instance (30d), `Ngo(owner)` (90d) | **None (Permissionless)** |
 
