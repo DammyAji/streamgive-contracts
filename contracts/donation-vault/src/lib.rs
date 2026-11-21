@@ -345,6 +345,20 @@ pub struct Config {
     pub renounced: bool,
 }
 
+/// A page of results from `withdraw_all` (issue #342): the net payout for each
+/// stream in the page plus the cursor for the next page.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawAllPage {
+    /// Net payout per stream in the page, in NGO-index order. A stream that
+    /// had nothing to withdraw contributes `0`.
+    pub amounts: Vec<i128>,
+    /// The `start` to pass on the next call: one past the end of this page,
+    /// clamped to the NGO's stream count. Iteration is complete once it
+    /// reaches that count (see `streams_by_ngo`).
+    pub next: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub enum DataKey {
@@ -3093,6 +3107,103 @@ impl DonationVault {
         }
 
         Ok(net_amounts)
+    }
+
+    /// Withdraws from every stream an NGO owns, a bounded page at a time, using
+    /// the NGO's stream index so the caller never has to list stream ids
+    /// off-chain (issue #342).
+    ///
+    /// `start` and `limit` select the page: streams are taken from the NGO's
+    /// index in creation order from position `start`, up to `limit` of them.
+    /// `limit` is clamped to `MAX_BATCH_WITHDRAW_STREAMS`, matching
+    /// `withdraw_batch`'s footprint budget. Each stream is settled exactly as
+    /// `withdraw` would, and the page is returned with the cursor to pass as
+    /// `start` next time; iteration is complete when `next` reaches the NGO's
+    /// stream count (`streams_by_ngo(ngo, 0, ..).len()`).
+    ///
+    /// The NGO authorizes the call once. A page whose streams have all accrued
+    /// nothing is not an error: it returns one `0` per stream in the page, so
+    /// the caller can simply advance the cursor and keep paging.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::{Address as _, Ledger}, token, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// # let token_admin = Address::generate(&env);
+    /// # let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
+    /// # let token_client = token::StellarAssetClient::new(&env, &sac.address());
+    /// # let donor = Address::generate(&env);
+    /// # let ngo = Address::generate(&env);
+    /// # token_client.mint(&donor, &3_000);
+    /// let _a = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
+    /// let _b = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
+    /// env.ledger().with_mut(|l| l.timestamp += 50);
+    ///
+    /// // Collect from this NGO's first (and only) page of streams.
+    /// let page = client.withdraw_all(&ngo, &0, &20);
+    /// assert_eq!(page.amounts.len(), 2);
+    /// assert_eq!(page.next, 2);
+    /// ```
+    pub fn withdraw_all(
+        env: Env,
+        ngo: Address,
+        start: u32,
+        limit: u32,
+    ) -> Result<WithdrawAllPage, Error> {
+        require_not_paused(&env)?;
+
+        let index: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NgoStreams(ngo))
+            .unwrap_or_else(|| Vec::new(&env));
+        let total = index.len();
+
+        if limit == 0 || start >= total {
+            return Ok(WithdrawAllPage {
+                amounts: Vec::new(&env),
+                next: total,
+            });
+        }
+
+        let effective_limit = limit.min(MAX_BATCH_WITHDRAW_STREAMS);
+        let end = start
+            .checked_add(effective_limit)
+            .unwrap_or(total)
+            .min(total);
+
+        let mut page = Vec::new(&env);
+        for position in start..end {
+            if let Some(stream_id) = index.get(position) {
+                page.push_back(stream_id);
+            }
+        }
+
+        // Settle the page exactly like `withdraw_batch` (one transfer per
+        // token plus a `withdraw` event per stream). A page that accrues
+        // nothing is normal mid-pagination, so it yields zero entries rather
+        // than an error, letting the caller advance the cursor.
+        let page_len = page.len();
+        let amounts = match Self::withdraw_batch(env.clone(), page) {
+            Ok(amounts) => amounts,
+            Err(Error::NothingToWithdraw) => {
+                let mut zeros = Vec::new(&env);
+                for _ in 0..page_len {
+                    zeros.push_back(0i128);
+                }
+                zeros
+            }
+            Err(error) => return Err(error),
+        };
+
+        Ok(WithdrawAllPage { amounts, next: end })
     }
 
     /// Stops a stream for good: settles whatever has already accrued to the

@@ -56,6 +56,12 @@ stellar contract invoke --id <ID> --source ngo --network testnet \
   --send=no --cost \
   -- withdraw_batch --stream_ids '[0, 1, 2]'
 
+# Sweep an NGO's streams a page at a time, without listing IDs (returns the
+# next cursor as `next`; repeat with --start <next> until it stops advancing).
+stellar contract invoke --id <ID> --source ngo --network testnet \
+  --send=no --cost \
+  -- withdraw_all --ngo <NGO_G_ADDRESS> --start 0 --limit 20
+
 # Reassign an active stream to a different verified NGO (donor identity).
 stellar contract invoke --id <ID> --source donor --network testnet \
   --send=no --cost \
@@ -79,7 +85,7 @@ functions are the ones worth measuring:
 
 | Group | Functions |
 | --- | --- |
-| Streams | `create_stream`, `create_stream_with_start`, `create_stream_with_memo`, `withdraw`, `withdraw_batch`, `cancel_stream`, `rescue_stream`, `top_up`, `modify_rate`, `transfer_stream`, `extend_stream` |
+| Streams | `create_stream`, `create_stream_with_start`, `create_stream_with_memo`, `withdraw`, `withdraw_batch`, `withdraw_all`, `cancel_stream`, `rescue_stream`, `top_up`, `modify_rate`, `transfer_stream`, `extend_stream` |
 | Admin | `__constructor`, `init`, `propose_admin`, `accept_admin`, `cancel_admin_proposal`, `renounce_admin`, `pause`, `unpause`, `upgrade` |
 | Configuration | `set_treasury`, `clear_treasury`, `set_fee_bps`, `set_token_fee_bps`, `clear_token_fee_bps`, `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_max_rate`, `clear_max_rate`, `set_min_duration`, `set_registry`, `clear_registry`, `set_payout_address` |
 | Read-only | `admin`, `pending_admin`, `get_stream`, `get_streams`, `streams_by_donor`, `stream_count`, `total_donated`, `pending_accrual`, `depletion_time`, `pending_payout`, `paused`, `get_config`, `treasury`, `fee_bps`, `max_fee_bps`, `token_fee_bps`, `allowed_tokens`, `min_deposit`, `cancel_grace_ledgers`, `max_streams_per_donor`, `max_rate`, `min_duration`, `registry`, `payout_address` |
@@ -92,6 +98,10 @@ Batching notes:
   stream IDs per call to stay within Soroban's CPU and ledger footprint
   limits. It aggregates net payouts and fees per token so only one NGO
   transfer (and at most one treasury fee transfer) is made per distinct token.
+- `withdraw_all` settles an NGO's streams a page at a time off the NGO's index,
+  so its cost is bounded per call like `withdraw_batch`'s: the `limit` argument
+  is clamped to `MAX_BATCH_WITHDRAW_STREAMS` (20). A full sweep of many streams
+  therefore costs one simulated call per page of up to 20.
 - `get_streams` is capped at `MAX_BATCH_GET_STREAMS` (40) stream IDs per
   call to stay within Soroban's per-transaction ledger read footprint limit.
 

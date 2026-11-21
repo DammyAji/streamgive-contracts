@@ -66,6 +66,14 @@ This project does not yet follow a formal versioning scheme — each contract's
   `get_config`. A deposit that would drain sooner is rejected with
   `Error::StreamTooShort` (39), distinct from `InvalidAmount`. Emits a `mindur`
   event. Off by default (`0`) (#340).
+- `donation-vault`: `withdraw_all(ngo, start, limit)` settles an NGO's streams
+  a bounded page at a time straight from the NGO's stream index, so a caller
+  never has to list stream ids off-chain or know when it has seen them all. It
+  returns a `WithdrawAllPage { amounts, next }` — the net payout per stream in
+  page order and the cursor to pass as `start` next time; iteration is complete
+  once `next` reaches the NGO's stream count. `limit` is clamped to
+  `MAX_BATCH_WITHDRAW_STREAMS`, and a page that has accrued nothing yields one
+  `0` per stream and still advances the cursor rather than failing (#342).
 - Contract events for registry and vault state changes (see
   [`docs/EVENTS.md`](docs/EVENTS.md)).
 - Document storage TTL policy, inactivity expiry risks, and keep-alive entry

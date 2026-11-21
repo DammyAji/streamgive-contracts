@@ -431,7 +431,8 @@ different address.
 | Topics | `("payoutset", ngo: Address)` |
 | Data | `payout: Address` (the new payout address) |
 
-`withdraw` and `withdraw_batch` pay the net amount to this address while the
+`withdraw`, `withdraw_batch`, and `withdraw_all` pay the net amount to this
+address while the
 NGO owner key continues to authorise those calls. Until an NGO sets one,
 `payout_address()` returns `None` and payouts go to the owner address itself.
 An indexer can track a given NGO's payout destination from these events without
@@ -523,7 +524,9 @@ short label only — never truncate or reinterpret it.
 ### `withdraw`
 
 Emitted by `withdraw` when an NGO claims everything accrued on a stream
-since the last checkpoint.
+since the last checkpoint. `withdraw_batch` and `withdraw_all` emit one of
+these per contributing stream, so an indexer handles single and paginated
+withdrawals identically.
 
 | | |
 |---|---|

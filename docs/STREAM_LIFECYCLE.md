@@ -12,7 +12,7 @@ emergency `rescue_stream` path works while paused. It complements
 | Actor | Role |
 | --- | --- |
 | `Donor` | Funds the stream and can top it up, change its rate, transfer it to another NGO, or cancel it. |
-| `NGO` | Receives the accrued funds and authorizes `withdraw` and `withdraw_batch`. |
+| `NGO` | Receives the accrued funds and authorizes `withdraw`, `withdraw_batch`, and `withdraw_all`. |
 | `DonationVault` | Holds the deposit and streams it to the NGO over time. |
 | `Token` | The Stellar asset contract (SAC) the stream is denominated in. |
 | `Treasury` | Optional recipient of the protocol fee, only used if configured. |
@@ -105,7 +105,8 @@ sequenceDiagram
 
 Notes:
 
-- `withdraw` and `withdraw_batch` require the **NGO's** auth; `create_stream`,
+- `withdraw`, `withdraw_batch`, and `withdraw_all` require the **NGO's** auth;
+  `create_stream`,
   `create_stream_with_start`, `create_stream_with_memo`, `top_up`,
   `modify_rate`, `transfer_stream`, and
   `cancel_stream` require the **donor's** auth; `rescue_stream` requires the
@@ -159,6 +160,44 @@ sequenceDiagram
     end
     loop each contributing stream
         Vault-->>NGO: withdraw(stream_id, accrued, fee, net)
+    end
+    deactivate Vault
+```
+
+## Fork: sweep an NGO's streams (`withdraw_all`)
+
+`withdraw_all` collects from an NGO's streams a bounded page at a time without
+the caller having to know any stream ids: it reads the NGO's stream index in
+creation order and settles the slice `[start, start + limit)`, exactly like
+`withdraw_batch` does. `limit` is clamped to `MAX_BATCH_WITHDRAW_STREAMS` (20).
+The call returns `WithdrawAllPage { amounts, next }`, where `amounts` holds the
+net payout per stream in page order and `next` is the cursor to pass as `start`
+on the next call. Paging is done when `next` reaches the NGO's stream count.
+
+Unlike `withdraw_batch`, a page that has accrued nothing is **not** an error: it
+returns one `0` per stream and advances the cursor, so a dormant page in the
+middle of a sweep never blocks the rest. A page where at least one stream
+accrued emits the usual per-stream `withdraw` events and makes one net transfer
+per token (plus any treasury fee transfer), identical to `withdraw_batch`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor NGO
+    participant Vault as DonationVault
+    participant Token as Token
+
+    NGO->>Vault: withdraw_all(ngo, start, limit)
+    activate Vault
+    Vault->>Vault: validate pause; read NgoStreams index; clamp limit to 20
+    Vault->>Vault: page = index[start .. start + limit]
+    Vault->>Vault: settle page as withdraw_batch(page)
+    alt page accrued nothing
+        Vault-->>NGO: WithdrawAllPage { amounts: [0, ...], next }
+    else
+        Vault->>Token: transfer net per token to NGO payout address
+        Vault-->>NGO: withdraw(stream_id, accrued, fee, net) per contributing stream
+        Vault-->>NGO: WithdrawAllPage { amounts, next }
     end
     deactivate Vault
 ```
@@ -282,8 +321,8 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> Active: create_stream / create_stream_with_start / create_stream_with_memo
-    Active --> Active: withdraw / withdraw_batch / top_up / modify_rate / transfer_stream
-    Active --> Drained: withdraw / withdraw_batch / settle (balance == 0)
+    Active --> Active: withdraw / withdraw_batch / withdraw_all / top_up / modify_rate / transfer_stream
+    Active --> Drained: withdraw / withdraw_batch / withdraw_all / settle (balance == 0)
     Drained --> Active: top_up
     Active --> Cancelled: cancel_stream / rescue_stream (paused)
     Drained --> Cancelled: cancel_stream / rescue_stream (paused)
@@ -293,7 +332,8 @@ stateDiagram-v2
 `Active` is the normal state, `Drained` means `balance` reached zero without
 cancellation (and can return to `Active` via `top_up`), and `Cancelled` is
 terminal. `pause` / `unpause` (admin-only) block `create_stream`, `withdraw`,
-`withdraw_batch`, `top_up`, `modify_rate`, and `transfer_stream` globally,
+`withdraw_batch`, `withdraw_all`, `top_up`, `modify_rate`, and `transfer_stream`
+globally,
 leave `cancel_stream` available so donors can always recover their remaining
 funds, and unlock `rescue_stream` for admin incident response.
 

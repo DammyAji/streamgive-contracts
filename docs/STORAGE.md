@@ -146,6 +146,7 @@ The following table summarizes all entry points that automatically bump storage 
 | --- | --- | --- | --- |
 | `donation-vault` | `create_stream` | Instance (30d), `Stream(id)` (90d) | Donor |
 | `donation-vault` | `withdraw` | Instance (30d), `Stream(id)` (90d) | NGO |
+| `donation-vault` | `withdraw_all` | Instance (30d), `Stream(id)` (90d) — one page of the NGO's streams | NGO |
 | `donation-vault` | `top_up` | Instance (30d), `Stream(id)` (90d) | Donor |
 | `donation-vault` | `modify_rate` | Instance (30d), `Stream(id)` (90d) | Donor |
 | `donation-vault` | `cancel_stream` | Instance (30d), `Stream(id)` (90d + `cancel_grace_ledgers`) | Donor |

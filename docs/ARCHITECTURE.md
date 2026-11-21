@@ -59,14 +59,15 @@ review work can be delegated without sharing the admin key; reads and
 
 Holds donor funds and streams them to an NGO at a fixed rate per second.
 Owns the `Stream` struct and the full lifecycle: `create_stream`,
-`withdraw`, `withdraw_batch`, `top_up`, `modify_rate`, `transfer_stream`,
-`cancel_stream`, and `rescue_stream`. Emits typed Soroban events for stream
+`withdraw`, `withdraw_batch`, `withdraw_all`, `top_up`, `modify_rate`,
+`transfer_stream`, `cancel_stream`, and `rescue_stream`. Emits typed Soroban
+events for stream
 lifecycle transitions and admin configuration changes, though not every
 state-changing call emits exactly one event: TTL-only bumps (`extend_stream`)
 and no-op calls (such as `modify_rate` with the same rate, `transfer_stream`
 to the same NGO, `clear_token_fee_bps` with no override, or `cancel_stream`
-when nothing moved) emit no event, while `withdraw_batch` emits one
-`withdraw` event per contributing stream. See `docs/EVENTS.md` for the
+when nothing moved) emit no event, while `withdraw_batch` and `withdraw_all`
+emit one `withdraw` event per contributing stream. See `docs/EVENTS.md` for the
 topic/data schema.
 
 #### Token transfers and reentrancy

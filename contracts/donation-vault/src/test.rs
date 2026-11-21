@@ -5436,6 +5436,129 @@ fn withdraw_batch_with_cancelled_stream_skips_cancelled_accrual() {
 }
 
 // =============================================================================
+// Issue #342: withdraw_all pagination
+// =============================================================================
+
+#[test]
+fn withdraw_all_pages_through_more_streams_than_the_page_size() {
+    let s = setup();
+    // More streams than one page can hold (MAX_BATCH_WITHDRAW_STREAMS), so
+    // collecting them all needs several calls.
+    let count: u32 = 25;
+    s.token_admin.mint(&s.donor, &(count as i128 * 1_000));
+    for _ in 0..count {
+        s.client
+            .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    }
+
+    // 50 seconds at 10/s accrues 500 on every stream.
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    let mut start: u32 = 0;
+    let mut calls = 0;
+    let mut total_paid: i128 = 0;
+    loop {
+        let page = s.client.withdraw_all(&s.ngo, &start, &10);
+        assert_eq!(page.amounts.len(), 10u32.min(count - start));
+        for amount in page.amounts.iter() {
+            assert_eq!(amount, 500);
+            total_paid += amount;
+        }
+        calls += 1;
+        start = page.next;
+        if start >= count {
+            break;
+        }
+    }
+
+    // 25 streams in pages of 10 take three calls.
+    assert_eq!(calls, 3);
+    assert_eq!(total_paid, count as i128 * 500);
+    assert_eq!(s.token.balance(&s.ngo), count as i128 * 500);
+
+    // Paging past the end is a harmless empty page that still reports the end.
+    let done = s.client.withdraw_all(&s.ngo, &start, &10);
+    assert_eq!(done.amounts.len(), 0);
+    assert_eq!(done.next, count);
+}
+
+#[test]
+fn withdraw_all_clamps_limit_to_the_batch_cap() {
+    let s = setup();
+    let count: u32 = 25;
+    s.token_admin.mint(&s.donor, &(count as i128 * 1_000));
+    for _ in 0..count {
+        s.client
+            .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    }
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    // A limit above the batch cap only settles the cap's worth this call.
+    let page = s.client.withdraw_all(&s.ngo, &0, &100);
+    assert_eq!(page.amounts.len(), MAX_BATCH_WITHDRAW_STREAMS);
+    assert_eq!(page.next, MAX_BATCH_WITHDRAW_STREAMS);
+}
+
+#[test]
+fn withdraw_all_returns_zeros_when_a_page_has_accrued_nothing() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &3_000);
+    for _ in 0..3 {
+        s.client
+            .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    }
+
+    // No time has passed, so nothing has accrued. That is not an error for a
+    // pager: the page reports one zero per stream and advances the cursor.
+    let page = s.client.withdraw_all(&s.ngo, &0, &10);
+    assert_eq!(page.amounts.len(), 3);
+    assert_eq!(page.amounts.get(0), Some(0));
+    assert_eq!(page.amounts.get(2), Some(0));
+    assert_eq!(page.next, 3);
+    assert_eq!(s.token.balance(&s.ngo), 0);
+}
+
+#[test]
+fn withdraw_all_on_ngo_without_streams_returns_empty_page() {
+    let s = setup();
+
+    let page = s.client.withdraw_all(&s.ngo, &0, &10);
+    assert_eq!(page.amounts.len(), 0);
+    assert_eq!(page.next, 0);
+}
+
+#[test]
+fn withdraw_all_only_settles_the_named_ngos_streams() {
+    let s = setup();
+    let other_ngo = Address::generate(&s.env);
+    s.token_admin.mint(&s.donor, &2_000);
+
+    s.client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client
+        .create_stream(&s.donor, &other_ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    let page = s.client.withdraw_all(&s.ngo, &0, &10);
+    assert_eq!(page.amounts.len(), 1);
+    assert_eq!(page.next, 1);
+    assert_eq!(s.token.balance(&s.ngo), 500);
+    assert_eq!(s.token.balance(&other_ngo), 0);
+}
+
+#[test]
+fn withdraw_all_requires_ngo_auth() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    s.client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+
+    s.client.withdraw_all(&s.ngo, &0, &10);
+    assert_auth_required_from(&s, &s.ngo, "withdraw_all");
+}
+
+// =============================================================================
 // NGO payout address
 // =============================================================================
 

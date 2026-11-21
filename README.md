@@ -75,6 +75,7 @@ keep-alive, continues to work. The table below lists every public entry point.
 | `create_stream`, `create_stream_with_start`, `create_stream_with_memo` | **Rejected** — `ContractPaused` |
 | `withdraw` | **Rejected** — `ContractPaused` |
 | `withdraw_batch` | **Rejected** — `ContractPaused` |
+| `withdraw_all` | **Rejected** — `ContractPaused` |
 | `top_up` | **Rejected** — `ContractPaused` |
 | `modify_rate` | **Rejected** — `ContractPaused` |
 | `transfer_stream` | **Rejected** — `ContractPaused` |
@@ -96,8 +97,9 @@ keeps growing while the vault is paused, so a stream paused for a week still
 owes a week of accrual once the pause is lifted. That accrual is claimable via
 `withdraw` as soon as the vault is unpaused.
 
-`withdraw` and `withdraw_batch` being rejected is the point of the brake: they
-are the paths that pay tokens straight out of the vault, so a pause triggered
+`withdraw`, `withdraw_batch`, and `withdraw_all` being rejected is the point of
+the brake: they are the paths that pay tokens straight out of the vault, so a
+pause triggered
 by a suspected vulnerability has to close them or an attacker could drain funds
 while the rest of the contract is frozen.
 
@@ -310,13 +312,13 @@ currently allocated up to code 39. See [docs/UPGRADE_POLICY.md](docs/UPGRADE_POL
 | --- | --- | --- | --- |
 | 1 | `AlreadyInitialized` | `init` already created an admin. | `init` |
 | 2 | `NotInitialized` | No admin is stored. | `admin`, `propose_admin`, `cancel_admin_proposal`, `pause`, `unpause`, `set_treasury`, `clear_treasury`, `set_fee_bps`, `set_token_fee_bps`, `clear_token_fee_bps`, `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_min_duration`, `set_registry`, `renounce_admin`, `rescue_stream`, `upgrade`, `set_upgrade_delay`, `propose_upgrade`, `execute_upgrade`, `cancel_upgrade`, `sweep_surplus` |
-| 3 | `StreamNotFound` | No stream exists for the id. | `get_stream`, `pending_accrual`, `depletion_time`, `pending_payout`, `extend_stream`, `withdraw`, `withdraw_batch`, `cancel_stream`, `rescue_stream`, `top_up`, `modify_rate`, `transfer_stream` |
+| 3 | `StreamNotFound` | No stream exists for the id. | `get_stream`, `pending_accrual`, `depletion_time`, `pending_payout`, `extend_stream`, `withdraw`, `withdraw_batch`, `withdraw_all`, `cancel_stream`, `rescue_stream`, `top_up`, `modify_rate`, `transfer_stream` |
 | 4 | `InvalidAmount` | A deposit, rate, top-up, rate change, minimum deposit, or sweep amount was zero/negative (or a fee would swallow the first payout). | `create_stream`, `create_stream_with_start`, `create_stream_with_memo`, `top_up`, `modify_rate`, `set_min_deposit`, `sweep_surplus` |
 | 5 | `NothingToWithdraw` | The stream accrued nothing since its last checkpoint. | `withdraw` |
-| 6 | `ContractPaused` | The admin paused the vault; see [Pausing](#pausing). | `create_stream`, `create_stream_with_start`, `create_stream_with_memo`, `withdraw`, `withdraw_batch`, `top_up`, `modify_rate`, `transfer_stream`, `sweep_surplus` |
+| 6 | `ContractPaused` | The admin paused the vault; see [Pausing](#pausing). | `create_stream`, `create_stream_with_start`, `create_stream_with_memo`, `withdraw`, `withdraw_batch`, `withdraw_all`, `top_up`, `modify_rate`, `transfer_stream`, `sweep_surplus` |
 | 7 | `FeeTooHigh` | Fee above the 1,000 bps (10%) cap. | `set_fee_bps`, `set_token_fee_bps` |
 | 8 | `NoPendingAdmin` | No admin proposal is pending. | `accept_admin`, `cancel_admin_proposal` |
-| 9 | `ArithmeticOverflow` | Checked balance, total, counter, or grace-ledger arithmetic left `i128`/`u64` range. | `create_stream`, `create_stream_with_start`, `create_stream_with_memo`, `withdraw`, `withdraw_batch`, `cancel_stream`, `top_up`, `modify_rate`, `transfer_stream`, `set_cancel_grace_ledgers` |
+| 9 | `ArithmeticOverflow` | Checked balance, total, counter, or grace-ledger arithmetic left `i128`/`u64` range. | `create_stream`, `create_stream_with_start`, `create_stream_with_memo`, `withdraw`, `withdraw_batch`, `withdraw_all`, `cancel_stream`, `top_up`, `modify_rate`, `transfer_stream`, `set_cancel_grace_ledgers` |
 | 10 | `SelfStream` | Donor and NGO are the same address. | `create_stream`, `create_stream_with_start`, `create_stream_with_memo` |
 | 11 | `InvalidTreasury` | Treasury address is the vault itself. | `set_treasury` |
 | 12 | `AlreadyPaused` | `pause` called while already paused. | `pause` |
@@ -335,7 +337,7 @@ currently allocated up to code 39. See [docs/UPGRADE_POLICY.md](docs/UPGRADE_POL
 | 25 | `DuplicateStreamId` | The same stream id appears twice in a batch withdrawal. | `withdraw_batch` |
 | 26 | `InvalidNgo` | The NGO is the vault's own address. | `create_stream`, `create_stream_with_start`, `create_stream_with_memo` |
 | 27 | `InvalidToken` | The token is the vault's own address. | `create_stream`, `create_stream_with_start`, `create_stream_with_memo` |
-| 28 | `StreamPaused` | `withdraw`/`withdraw_batch` called on a stream whose donor paused it with `pause_stream`. | `withdraw`, `withdraw_batch` |
+| 28 | `StreamPaused` | `withdraw`/`withdraw_batch`/`withdraw_all` called on a stream whose donor paused it with `pause_stream`. | `withdraw`, `withdraw_batch`, `withdraw_all` |
 | 29 | `RateTooHigh` | Rate exceeds the admin-configured `max_rate`. | `create_stream`, `create_stream_with_start`, `create_stream_with_memo`, `modify_rate` |
 | 30 | `StartTooFar` | `create_stream_with_start` was given a `start` more than one year (`MAX_START_DELAY_SECONDS`) ahead of the current ledger time. | `create_stream_with_start` |
 | 31 | `MemoTooLong` | `create_stream_with_memo` was given a `memo` longer than `MAX_MEMO_BYTES` (32) bytes. | `create_stream_with_memo` |
