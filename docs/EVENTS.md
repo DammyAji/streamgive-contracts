@@ -20,7 +20,9 @@ layout stable. Event type names include `RegisterEvent`, `RenamedEvent`,
 `PausedEvent`, `UnpausedEvent`, `TreasurySetEvent`, `TreasuryClearedEvent`,
 `FeeBpsSetEvent`, `TokenFeeBpsSetEvent`, `TokenFeeBpsClearedEvent`,
 `MinDepositSetEvent`, `CancelGraceLedgersSetEvent`, `RegistrySetEvent`,
-`MaxStreamsPerDonorSetEvent`, `InitializedEvent`, `UpgradedEvent`,
+`PayoutAddressSetEvent`, `MaxStreamsPerDonorSetEvent`, `MaxRateSetEvent`,
+`MaxRateClearedEvent`, `InitializedEvent`,
+`UpgradedEvent`,
 `CreatedEvent`, `WithdrawnEvent`, `CancelledStreamEvent`, `RescuedStreamEvent`,
 `ToppedUpEvent`, and `RateModifiedEvent`.
 
@@ -253,6 +255,32 @@ retention window applied to cancelled stream records.
 | Topics | `("grceset",)` |
 | Data | `grace_ledgers: u32` (the new window, in ledgers) |
 
+### `maxrate`
+
+Emitted by `set_max_rate` when an admin caps the per-second rate accepted by
+`create_stream` and `modify_rate`.
+
+| | |
+|---|---|
+| Topics | `("maxrate",)` |
+| Data | `max_rate: i128` (the new ceiling, in token units per second) |
+
+Rates above this ceiling are rejected with `RateTooHigh`. A ceiling of `0` or
+less fails with `InvalidAmount` and emits nothing. Until a ceiling is set, the
+event never appears and rates are uncapped.
+
+### `maxrtclr`
+
+Emitted by `clear_max_rate` when an admin removes the per-second rate ceiling.
+
+| | |
+|---|---|
+| Topics | `("maxrtclr",)` |
+| Data | `()` |
+
+After this event, `create_stream` and `modify_rate` accept any positive rate
+again, the same as if `set_max_rate` had never been called.
+
 ### `regset`
 
 Emitted by `set_registry` when an admin points the vault at an NGO registry
@@ -279,6 +307,21 @@ Clearing the registry removes the stored registry address (`registry()` returns 
 so subsequent `create_stream` calls accept any recipient address without registry
 verification.
 
+### `payoutset`
+
+Emitted by `set_payout_address` when an NGO points its withdrawals at a
+different address.
+
+| | |
+|---|---|
+| Topics | `("payoutset", ngo: Address)` |
+| Data | `payout: Address` (the new payout address) |
+
+`withdraw` and `withdraw_batch` pay the net amount to this address while the
+NGO owner key continues to authorise those calls. Until an NGO sets one,
+`payout_address()` returns `None` and payouts go to the owner address itself.
+An indexer can track a given NGO's payout destination from these events without
+polling `payout_address`.
 
 ### `upgrade`
 
@@ -296,10 +339,13 @@ Emitted by `create_stream` when a donor opens a new stream.
 | | |
 |---|---|
 | Topics | `("created", stream_id: u64)` |
-| Data | `(donor: Address, ngo: Address, token: Address, deposit: i128, rate: i128)` |
+| Data | `(donor: Address, ngo: Address, token: Address, deposit: i128, rate: i128, memo: Bytes)` |
 
 `deposit` is the amount pulled from the donor into the vault; `rate` is how
 much of it accrues to the NGO per second (see [`math::accrued`](../contracts/donation-vault/src/math.rs)).
+`memo` is the donor's optional free-form tag, e.g. a campaign id, capped at
+`MAX_MEMO_BYTES` (32) bytes and empty when none was supplied (#341). It is a
+short label only — never truncate or reinterpret it.
 
 ### `withdraw`
 
@@ -309,12 +355,14 @@ since the last checkpoint.
 | | |
 |---|---|
 | Topics | `("withdraw", stream_id: u64)` |
-| Data | `(accrued: i128, fee: i128, net: i128)` |
+| Data | `(accrued: i128, fee: i128, net: i128, payout: Address)` |
 
 `accrued` is the gross amount released from the stream's balance. `fee` is the
 protocol fee paid to the treasury (or `0` if no treasury is set or the effective
-fee is 0%). `net` is the net amount actually transferred to the NGO. The
-invariant `accrued = fee + net` holds for every payout.
+fee is 0%). `net` is the net amount actually transferred to the NGO's payout
+destination. `payout` is where that net amount was sent: the NGO's configured
+payout address if one is set via `set_payout_address`, otherwise the NGO owner
+address itself. The invariant `accrued = fee + net` holds for every payout.
 
 The `withdraw` entry point returns that same `net` amount, so callers displaying
 the payout receive the exact token units transferred to the NGO.
