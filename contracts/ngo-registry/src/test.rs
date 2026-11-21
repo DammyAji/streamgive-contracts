@@ -367,6 +367,7 @@ fn get_ngo_includes_metadata_uri() {
             name,
             verified: false,
             metadata_uri: uri,
+            verified_until: None,
         }
     );
 }
@@ -973,6 +974,7 @@ fn update_name_changes_name_before_approval() {
             name: fixed.clone(),
             verified: false,
             metadata_uri: None,
+            verified_until: None,
         }
     );
 }
@@ -1029,6 +1031,7 @@ fn update_name_after_revocation_succeeds() {
             name: fixed,
             verified: false,
             metadata_uri: None,
+            verified_until: None,
         }
     );
 }
@@ -1622,6 +1625,233 @@ fn removing_a_verified_ngo_is_rejected_and_leaves_count_unchanged() {
         Err(Ok(Error::AlreadyVerified))
     );
     assert_eq!(client.verified_count(), 1);
+}
+
+// =============================================================================
+// verification expiry and renewal (issue #348)
+// =============================================================================
+
+#[test]
+fn verify_period_defaults_to_zero() {
+    let (_env, client, _admin) = setup();
+    assert_eq!(client.verify_period(), 0);
+}
+
+#[test]
+fn set_verify_period_stores_value_and_emits_event() {
+    let (env, client, _admin) = setup();
+    let period = 1_000u64;
+    client.set_verify_period(&period);
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("verperiod"),).into_val(&env),
+                period.into_val(&env),
+            ),
+        ]
+    );
+    assert_eq!(client.verify_period(), period);
+}
+
+#[test]
+fn set_verify_period_requires_admin_auth() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+
+    assert_sole_auth(&env, &client, &admin, "set_verify_period");
+}
+
+#[test]
+fn set_verify_period_does_not_change_existing_approvals() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+    assert_eq!(client.get_ngo(&owner).verified_until, Some(1_000));
+
+    // Raising the period only affects future approvals and renewals.
+    client.set_verify_period(&5_000);
+    assert_eq!(client.get_ngo(&owner).verified_until, Some(1_000));
+}
+
+#[test]
+fn approve_without_period_never_expires() {
+    let (env, client, admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+
+    assert_eq!(client.get_ngo(&owner).verified_until, None);
+    assert!(client.is_verified(&owner));
+
+    // Without a period the verification is permanent, however far time moves.
+    env.ledger().with_mut(|l| l.timestamp = 10_000_000);
+    assert!(client.is_verified(&owner));
+}
+
+#[test]
+fn approve_stamps_verified_until_from_period() {
+    let (env, client, admin) = setup();
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    client.set_verify_period(&500);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+
+    assert_eq!(client.get_ngo(&owner).verified_until, Some(1_500));
+}
+
+#[test]
+fn is_verified_holds_until_the_boundary_then_lapses() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+    assert_eq!(client.get_ngo(&owner).verified_until, Some(1_000));
+
+    // One second before the expiry the entry is still verified.
+    env.ledger().with_mut(|l| l.timestamp = 999);
+    assert!(client.is_verified(&owner));
+
+    // At the expiry exactly, and after it, it is treated as unverified.
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    assert!(!client.is_verified(&owner));
+    env.ledger().with_mut(|l| l.timestamp = 1_001);
+    assert!(!client.is_verified(&owner));
+}
+
+#[test]
+fn get_ngo_reports_unverified_after_expiry() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+
+    let ngo = client.get_ngo(&owner);
+    assert!(!ngo.verified);
+    // The stored expiry is kept so an admin can still renew the entry.
+    assert_eq!(ngo.verified_until, Some(1_000));
+}
+
+#[test]
+fn renew_ngo_revives_a_lapsed_verification_and_emits_event() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+
+    // Time moves well past the original expiry.
+    env.ledger().with_mut(|l| l.timestamp = 4_000);
+    assert!(!client.is_verified(&owner));
+
+    client.renew_ngo(&owner);
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("renew"), owner.clone()).into_val(&env),
+                5_000u64.into_val(&env),
+            ),
+        ]
+    );
+    assert!(client.is_verified(&owner));
+    assert_eq!(client.get_ngo(&owner).verified_until, Some(5_000));
+}
+
+#[test]
+fn renew_ngo_requires_admin_auth() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+
+    client.renew_ngo(&owner);
+
+    assert_sole_auth(&env, &client, &admin, "renew_ngo");
+}
+
+#[test]
+fn renew_ngo_for_unregistered_ngo_fails() {
+    let (env, client, _admin) = setup();
+    client.set_verify_period(&1_000);
+    let random = Address::generate(&env);
+
+    assert_eq!(client.try_renew_ngo(&random), Err(Ok(Error::NotRegistered)));
+}
+
+#[test]
+fn renew_ngo_for_unapproved_ngo_fails() {
+    let (env, client, _admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    assert_eq!(client.try_renew_ngo(&owner), Err(Ok(Error::NotVerified)));
+}
+
+#[test]
+fn renew_ngo_without_configured_period_fails() {
+    let (env, client, admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+
+    // No period is configured, so there is no expiry to extend.
+    assert_eq!(client.try_renew_ngo(&owner), Err(Ok(Error::NoVerifyPeriod)));
+}
+
+#[test]
+fn renew_ngo_after_revoke_fails() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+    client.revoke_ngo(&admin, &owner);
+
+    assert_eq!(client.try_renew_ngo(&owner), Err(Ok(Error::NotVerified)));
+}
+
+#[test]
+fn revoke_clears_verified_until() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+    assert_eq!(client.get_ngo(&owner).verified_until, Some(1_000));
+
+    client.revoke_ngo(&admin, &owner);
+
+    assert_eq!(client.get_ngo(&owner).verified_until, None);
+}
+
+#[test]
+fn renew_ngo_bumps_instance_and_ngo_ttl() {
+    let (env, client, admin) = setup();
+    client.set_verify_period(&1_000);
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+    age_past_thresholds(&env, &client, &owner);
+
+    client.renew_ngo(&owner);
+
+    assert_ttls_bumped(&env, &client, &owner);
 }
 
 // =============================================================================

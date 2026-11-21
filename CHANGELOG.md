@@ -52,6 +52,14 @@ This project does not yet follow a formal versioning scheme — each contract's
   `Error::MetadataUriTooLong` (14). Emits a `metadata` event. Unlike the
   name, it stays editable after approval, so an NGO's website/logo reference
   can be kept current (#347).
+- `ngo-registry`: optional verification expiry. `set_verify_period` (admin)
+  sets a period in seconds that `approve_ngo` / `batch_approve` add to the
+  current time to stamp `Ngo.verified_until`; `verify_period` reads it back.
+  `renew_ngo` (admin) moves an entry's expiry forward from now. `is_verified`
+  and `get_ngo` treat a lapsed verification as unverified, while the stored
+  flag is kept so the entry can be renewed. A `renew` event carries the new
+  expiry and a `verperiod` event the new period; renewing with no period
+  configured fails with `Error::NoVerifyPeriod` (15) (#348).
 - Contract events for registry and vault state changes (see
   [`docs/EVENTS.md`](docs/EVENTS.md)).
 - Document storage TTL policy, inactivity expiry risks, and keep-alive entry
@@ -154,6 +162,11 @@ This project does not yet follow a formal versioning scheme — each contract's
 - **BREAKING** `ngo-registry`: the `Ngo` struct gains a
   `metadata_uri: Option<String>` field, so the value returned by `get_ngo`
   changes shape. Off-chain decoders of `Ngo` must add the new field (#347).
+- **BREAKING** `ngo-registry`: the `Ngo` struct also gains a
+  `verified_until: Option<u64>` field, so `get_ngo`'s return shape changes
+  again. Off-chain decoders of `Ngo` must add the new field. Verification is
+  now time-bounded when a period is configured, and a lapsed verification is
+  reported by `get_ngo`/`is_verified` as unverified (#348).
 - **BREAKING** `donation-vault`: the `withdraw` event data payload now includes
   the payout destination, changing from `(accrued: i128, fee: i128, net: i128)`
   to `(accrued: i128, fee: i128, net: i128, payout: Address)`. Off-chain

@@ -100,6 +100,19 @@ pub struct MetadataUriSetEvent {
     pub metadata_uri: Option<String>,
 }
 
+#[contractevent(topics = ["renew"], data_format = "single-value")]
+pub struct RenewedEvent {
+    #[topic]
+    pub owner: Address,
+    /// The new verification expiry, as a ledger timestamp.
+    pub verified_until: u64,
+}
+
+#[contractevent(topics = ["verperiod"], data_format = "single-value")]
+pub struct VerifyPeriodSetEvent {
+    pub verify_period: u64,
+}
+
 #[contracttype]
 // Debug and PartialEq let tests assert_eq! on a try_* call’s full
 // Result<Result<Ngo, _>, _> rather than unwrapping it by hand first.
@@ -113,6 +126,13 @@ pub struct Ngo {
     /// publishes about itself. `None` until the owner calls
     /// `set_metadata_uri`. Bounded by `MAX_METADATA_URI_LEN`. See issue #347.
     pub metadata_uri: Option<String>,
+    /// Optional ledger timestamp at which this verification lapses. Set by
+    /// `approve_ngo` / `batch_approve` from the configured verification period
+    /// (see `set_verify_period`), and moved forward by `renew_ngo`. `None` means
+    /// the verification never expires. Once the current ledger timestamp
+    /// reaches it the entry is treated as unverified by `is_verified` and
+    /// `get_ngo`, until an admin renews it. See issue #348.
+    pub verified_until: Option<u64>,
 }
 
 /// A single page of the NGO owners index, returned by `list_ngos_page`.
@@ -152,6 +172,10 @@ pub enum DataKey {
     /// Current number of verified NGO records, maintained by the review and
     /// removal entry points and read by `verified_count`.
     VerifiedCount,
+    /// The verification period in seconds applied to new approvals and to
+    /// `renew_ngo`. `0` (the default) means approvals never expire. See
+    /// `set_verify_period`.
+    VerifyPeriod,
 }
 
 #[contracterror]
@@ -187,6 +211,9 @@ pub enum Error {
     /// The supplied metadata URI is longer than `MAX_METADATA_URI_LEN`
     /// (512 bytes).
     MetadataUriTooLong = 14,
+    /// `renew_ngo` was called while no verification period is configured, so
+    /// there is no expiry to extend. Set one with `set_verify_period`.
+    NoVerifyPeriod = 15,
     // Error numbers are append-only: never renumber, reuse, or remove a
     // variant. New errors take the next unused number. See
     // docs/UPGRADE_POLICY.md.
@@ -271,6 +298,26 @@ fn set_verified_count(env: &Env, count: u64) {
     env.storage()
         .instance()
         .set(&DataKey::VerifiedCount, &count);
+}
+
+/// Reads the configured verification period in seconds. `0` (the default)
+/// means approvals never expire. See `set_verify_period`.
+fn get_verify_period(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::VerifyPeriod)
+        .unwrap_or(0)
+}
+
+/// Returns whether a verification expiry has lapsed at the current ledger
+/// time. `None` never expires. An entry stays valid while
+/// `now < verified_until`, so it is treated as unverified once `now` reaches
+/// the stored timestamp. See issue #348.
+fn has_expired(env: &Env, verified_until: Option<u64>) -> bool {
+    match verified_until {
+        Some(until) => env.ledger().timestamp() >= until,
+        None => false,
+    }
 }
 
 /// Returns whether a code point is an invisible or format character (category Cf).
@@ -422,6 +469,20 @@ fn approve_registered_ngo(env: &Env, ngo_owner: Address) -> Result<(), Error> {
         return Err(Error::AlreadyVerified);
     }
     ngo.verified = true;
+    // Stamp the verification expiry from the configured period (issue #348).
+    // A zero period leaves `verified_until` as `None`, i.e. no expiry, which
+    // is the default and matches the pre-expiry behaviour.
+    let period = get_verify_period(env);
+    ngo.verified_until = if period == 0 {
+        None
+    } else {
+        Some(
+            env.ledger()
+                .timestamp()
+                .checked_add(period)
+                .ok_or(Error::ArithmeticOverflow)?,
+        )
+    };
     env.storage().persistent().set(&key, &ngo);
 
     let verified = get_verified_count(env);
@@ -754,6 +815,7 @@ impl NgoRegistry {
             name: name.clone(),
             verified: false,
             metadata_uri: None,
+            verified_until: None,
         };
         env.storage().persistent().set(&key, &ngo);
 
@@ -1339,6 +1401,11 @@ impl NgoRegistry {
 
     /// Reads back an NGO's registry entry, registered or not.
     ///
+    /// A verification whose `verified_until` has passed is reported as
+    /// unverified (`verified: false`), so callers never act on a lapsed
+    /// approval; the stored flag and the past timestamp are left in place and
+    /// can be reactivated with `renew_ngo`. See issue #348.
+    ///
     /// # Examples
     ///
     /// ```rust,no_run
@@ -1358,15 +1425,21 @@ impl NgoRegistry {
     /// assert!(!ngo.verified);
     /// ```
     pub fn get_ngo(env: Env, owner: Address) -> Result<Ngo, Error> {
-        env.storage()
+        let mut ngo: Ngo = env
+            .storage()
             .persistent()
             .get(&DataKey::Ngo(owner))
-            .ok_or(Error::NotRegistered)
+            .ok_or(Error::NotRegistered)?;
+        if ngo.verified && has_expired(&env, ngo.verified_until) {
+            ngo.verified = false;
+        }
+        Ok(ngo)
     }
 
-    /// Returns whether an address is a registered, verified NGO.
-    /// Unknown and unverified addresses both return `false`.
-    /// Never errors or panics.
+    /// Returns whether an address is a currently verified, registered NGO.
+    /// Unknown and unverified addresses both return `false`, as does an
+    /// address whose verification has lapsed (`verified_until` passed).
+    /// Never errors or panics. See issue #348.
     ///
     /// # Examples
     ///
@@ -1428,6 +1501,11 @@ impl NgoRegistry {
     /// verified entry (decrement), so a dashboard can read the verified tally
     /// without listing and filtering every entry.
     ///
+    /// The counter tracks the stored verification flag. Time never clears that
+    /// flag, so an entry whose `verified_until` has lapsed still counts here
+    /// until an admin revokes or renews it, even though `is_verified` already
+    /// reports it as unverified. See issue #348.
+    ///
     /// # Examples
     ///
     /// ```rust,no_run
@@ -1447,6 +1525,68 @@ impl NgoRegistry {
     /// ```
     pub fn verified_count(env: Env) -> u64 {
         get_verified_count(&env)
+    }
+
+    /// Sets the verification period, in seconds, that `approve_ngo` /
+    /// `batch_approve` and `renew_ngo` add to the current ledger time to stamp
+    /// an entry's `verified_until`. Admin-only.
+    ///
+    /// A period of `0` (the default) means approvals never expire:
+    /// `verified_until` stays `None`. Changing the period only affects future
+    /// approvals and renewals; entries already approved keep their existing
+    /// expiry until they are renewed. Fails with `Error::NotInitialized`
+    /// before `init`. Publishes a `VerifyPeriodSetEvent`. See issue #348.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryArgs, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let admin = Address::generate(&env);
+    /// # let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// assert_eq!(client.verify_period(), 0);
+    ///
+    /// // Verifications last one year.
+    /// client.set_verify_period(&(365 * 24 * 60 * 60));
+    /// assert_eq!(client.verify_period(), 365 * 24 * 60 * 60);
+    /// ```
+    pub fn set_verify_period(env: Env, seconds: u64) -> Result<(), Error> {
+        require_admin(&env)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::VerifyPeriod, &seconds);
+        extend_instance_ttl(&env);
+
+        VerifyPeriodSetEvent {
+            verify_period: seconds,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Reads back the configured verification period in seconds. `0` means
+    /// approvals never expire. Never errors or panics. See `set_verify_period`
+    /// and issue #348.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryArgs, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let admin = Address::generate(&env);
+    /// # let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// assert_eq!(client.verify_period(), 0);
+    /// ```
+    pub fn verify_period(env: Env) -> u64 {
+        get_verify_period(&env)
     }
 
     /// Marks a registered NGO as verified. Callable by the admin or a listed
@@ -1559,6 +1699,9 @@ impl NgoRegistry {
             return Err(Error::NotVerified);
         }
         ngo.verified = false;
+        // A revoked verification has no expiry to keep; clear it so the entry
+        // doesn't carry a stale timestamp (#348).
+        ngo.verified_until = None;
         env.storage().persistent().set(&key, &ngo);
 
         let verified = get_verified_count(&env);
@@ -1571,6 +1714,78 @@ impl NgoRegistry {
         RevokedEvent {
             owner: ngo_owner,
             data: (),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Extends a lapsed — or still-valid — verification by the configured
+    /// period, moving its `verified_until` forward from the current ledger
+    /// time. Admin-only.
+    ///
+    /// This is the periodic-renewal counterpart to `approve_ngo`: an entry
+    /// whose verification has lapsed needs an admin to renew it, because
+    /// nothing on-chain flips the stored flag back on its own. The entry must
+    /// be registered (`Error::NotRegistered`) and its stored verification flag
+    /// must be set (`Error::NotVerified`); the flag stays set after a lapse, so
+    /// an expired entry can be renewed, while one that was never approved or
+    /// was revoked must be approved first. Renewal requires a non-zero
+    /// configured period, or it fails with `Error::NoVerifyPeriod`. Fails with
+    /// `Error::NotInitialized` before `init`. Publishes a `RenewedEvent` with
+    /// the new expiry. See issue #348.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env, String};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryArgs, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let admin = Address::generate(&env);
+    /// # let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// client.set_verify_period(&(365 * 24 * 60 * 60));
+    /// let owner = Address::generate(&env);
+    /// client.register(&owner, &String::from_str(&env, "Example NGO"));
+    /// client.approve_ngo(&admin, &owner);
+    ///
+    /// // A year later the verification has lapsed, and renewing it revives it.
+    /// client.renew_ngo(&owner);
+    /// assert!(client.is_verified(&owner));
+    /// ```
+    pub fn renew_ngo(env: Env, ngo_owner: Address) -> Result<(), Error> {
+        require_admin(&env)?;
+
+        let period = get_verify_period(&env);
+        if period == 0 {
+            return Err(Error::NoVerifyPeriod);
+        }
+
+        let key = DataKey::Ngo(ngo_owner.clone());
+        let mut ngo: Ngo = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotRegistered)?;
+        if !ngo.verified {
+            return Err(Error::NotVerified);
+        }
+
+        let verified_until = env
+            .ledger()
+            .timestamp()
+            .checked_add(period)
+            .ok_or(Error::ArithmeticOverflow)?;
+        ngo.verified_until = Some(verified_until);
+        env.storage().persistent().set(&key, &ngo);
+
+        extend_instance_ttl(&env);
+        extend_ngo_ttl(&env, &ngo_owner);
+
+        RenewedEvent {
+            owner: ngo_owner,
+            verified_until,
         }
         .publish(&env);
 

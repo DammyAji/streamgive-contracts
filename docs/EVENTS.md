@@ -24,8 +24,8 @@ layout stable. Event type names include `RegisterEvent`, `RenamedEvent`,
 `MaxRateClearedEvent`, `InitializedEvent`,
 `UpgradedEvent`, `UpgradeProposedEvent`, `UpgradeCancelledEvent`,
 `UpgradeDelaySetEvent`, `ApproverAddedEvent`, `ApproverRemovedEvent`,
-`MetadataUriSetEvent`, `CreatedEvent`, `WithdrawnEvent`,
-`CancelledStreamEvent`, `RescuedStreamEvent`, `ToppedUpEvent`,
+`MetadataUriSetEvent`, `RenewedEvent`, `VerifyPeriodSetEvent`, `CreatedEvent`,
+`WithdrawnEvent`, `CancelledStreamEvent`, `RescuedStreamEvent`, `ToppedUpEvent`,
 `RateModifiedEvent`, and `SurplusSweptEvent`.
 
 `Address`, `i128`, `u64`, `u32`, `bool`, and `String` are the standard
@@ -83,6 +83,12 @@ Emitted by `approve_ngo` when an admin marks a registered NGO as verified.
 |---|---|
 | Topics | `("approved", ngo_owner: Address)` |
 | Data | `()` (no payload) |
+
+When a verification period is configured, approval also stamps
+`Ngo.verified_until` on the entry; the event payload itself is unchanged, so
+read `get_ngo` for the expiry. A lapsed verification is reported as
+unverified by `get_ngo` / `is_verified`, and is revived with `renew_ngo`
+(see the `renew` event).
 
 ### `revoked`
 
@@ -175,6 +181,33 @@ approver list, revoking that right.
 
 Removing an address that is not on the list fails with `NotApprover` and
 emits nothing.
+
+### `renew`
+
+Emitted by `renew_ngo` when the admin extends an NGO's verification, moving
+its expiry forward from the current ledger time by the configured verification
+period. The `data` is the new expiry as a ledger timestamp, and it is
+readable as `Ngo.verified_until` from `get_ngo`.
+
+| | |
+|---|---|
+| Topics | `("renew", owner: Address)` |
+| Data | `verified_until: u64` |
+
+A verification that has lapsed can be renewed as long as its stored flag is
+still set; one that was revoked must be approved again first.
+
+### `verperiod`
+
+Emitted by `set_verify_period` when the admin changes the verification period.
+`data` is the new period in seconds; `0` means approvals never expire. The
+period applies to `approve_ngo` / `batch_approve` and `renew_ngo` from that
+point on, and does not alter entries already approved.
+
+| | |
+|---|---|
+| Topics | `("verperiod",)` |
+| Data | `verify_period: u64` |
 
 ## `donation-vault`
 
