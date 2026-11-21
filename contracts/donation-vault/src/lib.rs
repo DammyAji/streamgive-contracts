@@ -147,6 +147,11 @@ pub struct MaxRateClearedEvent {
     pub data: (),
 }
 
+#[contractevent(topics = ["mindur"], data_format = "single-value")]
+pub struct MinDurationSetEvent {
+    pub min_duration: u64,
+}
+
 #[contractevent(topics = ["rescue"], data_format = "single-value")]
 pub struct RescuedStreamEvent {
     #[topic]
@@ -327,6 +332,10 @@ pub struct Config {
     /// The highest per-second `rate` accepted by `create_stream` and
     /// `modify_rate`, when an admin has configured one. `None` means no cap.
     pub max_rate: Option<i128>,
+    /// The shortest time to depletion, in seconds, an admin will accept for a
+    /// new or re-rated stream. `0` means no minimum is enforced. See
+    /// `set_min_duration` and issue #340.
+    pub min_duration: u64,
     pub registry: Option<Address>,
     pub cancel_grace_ledgers: u32,
     pub total_donated: i128,
@@ -404,6 +413,10 @@ pub enum DataKey {
     /// of stream balances for that token). Used by `sweep_surplus` to bound a
     /// sweep to the surplus above it. Absent means zero. See issue #346.
     CommittedBalance(Address),
+    /// Shortest time to depletion, in seconds, that `create_stream` and
+    /// `modify_rate` accept. Absent (or zero) means no minimum. See
+    /// `set_min_duration` and issue #340.
+    MinDuration,
 }
 
 #[contracterror]
@@ -511,6 +524,11 @@ pub enum Error {
     /// `sweep_surplus` was asked to move more than the surplus above the
     /// token's committed balance, which would dip into stream funds.
     SweepExceedsSurplus = 38,
+    /// A stream's deposit would deplete in fewer seconds than the
+    /// admin-configured `min_duration`. Raised by `create_stream` and
+    /// `modify_rate` before any funds move. Distinct from `InvalidAmount`,
+    /// which only covers a zero or negative amount. See issue #340.
+    StreamTooShort = 39,
     // Error numbers are append-only: never renumber, reuse, or remove a
     // variant. New errors take the next unused number. See
     // docs/UPGRADE_POLICY.md.
@@ -801,6 +819,32 @@ fn max_rate_cap(env: &Env) -> Option<i128> {
     env.storage().instance().get(&DataKey::MaxRate)
 }
 
+/// Returns the admin-configured minimum time to depletion, in seconds. `0`
+/// (the default) means no minimum is enforced, so the check in
+/// `create_stream` and `modify_rate` is skipped entirely. See issue #340.
+fn min_duration_seconds(env: &Env) -> u64 {
+    env.storage().instance().get(&DataKey::MinDuration).unwrap_or(0)
+}
+
+/// Returns true when a stream holding `balance` at a per-second `rate` would
+/// deplete in fewer than `min_duration` seconds. A `min_duration` of `0`
+/// disables the check.
+///
+/// The lifespan is measured with ceiling division so a stream that lasts a
+/// full final partial second is not misjudged: a 100-unit balance at 30 per
+/// second lasts 4 seconds, not 3. `ceil(balance / rate) < min_duration` is
+/// rewritten as `balance <= (min_duration - 1) * rate`, which avoids the
+/// division and reports the (unreachable) overflow case as "too short".
+fn depletes_before_min_duration(balance: i128, rate: i128, min_duration: u64) -> bool {
+    if min_duration == 0 {
+        return false;
+    }
+    match ((min_duration - 1) as i128).checked_mul(rate) {
+        Some(threshold) => balance <= threshold,
+        None => true,
+    }
+}
+
 fn record_outflow_totals(env: &Env, gross: i128, fee: i128) -> Result<(), Error> {
     if gross > 0 {
         let withdrawn: i128 = env
@@ -949,6 +993,14 @@ fn create_stream_inner(
         if rate > max_rate {
             return Err(Error::RateTooHigh);
         }
+    }
+
+    // Optional minimum lifespan (issue #340): a deposit that would drain in
+    // fewer than `min_duration` seconds is almost always a mistyped rate, so
+    // it is rejected before any funds move. Distinct from `DepositTooLow`
+    // (deposit size alone) and `InvalidAmount` (zero/negative).
+    if depletes_before_min_duration(deposit, rate, min_duration_seconds(&env)) {
+        return Err(Error::StreamTooShort);
     }
 
     // Per-donor stream cap (issue #94). Read before the token transfer
@@ -1767,7 +1819,7 @@ impl DonationVault {
 
     /// Reads back all admin-set configuration and contract state parameters in one call:
     /// `paused`, `treasury`, `fee_bps`, `min_deposit`, `max_streams_per_donor`,
-    /// `max_rate`, `registry`, `cancel_grace_ledgers`, `total_donated`,
+    /// `max_rate`, `min_duration`, `registry`, `cancel_grace_ledgers`, `total_donated`,
     /// `total_withdrawn`, `total_fees_collected`, `pending_admin`, and `renounced`.
     pub fn get_config(env: Env) -> Config {
         Config {
@@ -1789,6 +1841,7 @@ impl DonationVault {
                 .get(&DataKey::MaxStreamsPerDonor)
                 .unwrap_or(DEFAULT_MAX_STREAMS_PER_DONOR),
             max_rate: max_rate_cap(&env),
+            min_duration: min_duration_seconds(&env),
             registry: env.storage().instance().get(&DataKey::Registry),
             cancel_grace_ledgers: env
                 .storage()
@@ -2300,6 +2353,49 @@ impl DonationVault {
     /// until an admin sets one. See `set_max_rate`.
     pub fn max_rate(env: Env) -> Option<i128> {
         max_rate_cap(&env)
+    }
+
+    /// Sets the shortest allowed time to depletion, in seconds. Admin-gated.
+    /// `create_stream` and `modify_rate` reject a stream whose deposit would
+    /// drain in fewer than this many seconds with `Error::StreamTooShort`.
+    ///
+    /// This is off by default (`0`): until an admin sets it, a deposit can be
+    /// configured to drain in a single second, which is rarely intended and
+    /// wastes fees for everyone. Setting a floor catches a mistyped rate at
+    /// the contract edge instead of after the deposit is gone. Passing `0`
+    /// disables the check.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// client.set_min_duration(&60);
+    /// assert_eq!(client.min_duration(), 60);
+    /// ```
+    pub fn set_min_duration(env: Env, min_duration: u64) -> Result<(), Error> {
+        require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::MinDuration, &min_duration);
+        extend_instance_ttl(&env);
+
+        MinDurationSetEvent { min_duration }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Reads back the configured minimum stream duration in seconds. `0`
+    /// until an admin sets one, meaning no minimum is enforced. See
+    /// `set_min_duration`.
+    pub fn min_duration(env: Env) -> u64 {
+        min_duration_seconds(&env)
     }
 
     /// Sets the NGO registry contract used to verify NGOs before a stream
@@ -3376,6 +3472,14 @@ impl DonationVault {
         // the NGO, so it stays available even after a revocation.
         if new_rate > stream.rate {
             require_verified_ngo(&env, &stream.ngo)?;
+        }
+
+        // Optional minimum lifespan (issue #340): the stream must still last
+        // at least `min_duration` seconds at the new rate. Checked against the
+        // remaining balance before settling, so a rejection leaves the stream
+        // — and its funds — exactly as they were.
+        if depletes_before_min_duration(stream.balance, new_rate, min_duration_seconds(&env)) {
+            return Err(Error::StreamTooShort);
         }
 
         let now = env.ledger().timestamp();

@@ -60,6 +60,12 @@ This project does not yet follow a formal versioning scheme — each contract's
   flag is kept so the entry can be renewed. A `renew` event carries the new
   expiry and a `verperiod` event the new period; renewing with no period
   configured fails with `Error::NoVerifyPeriod` (15) (#348).
+- `donation-vault`: optional minimum stream duration. `set_min_duration` (admin)
+  sets the shortest time to depletion, in seconds, that `create_stream` and
+  `modify_rate` accept; `min_duration` reads it back and it is included in
+  `get_config`. A deposit that would drain sooner is rejected with
+  `Error::StreamTooShort` (39), distinct from `InvalidAmount`. Emits a `mindur`
+  event. Off by default (`0`) (#340).
 - Contract events for registry and vault state changes (see
   [`docs/EVENTS.md`](docs/EVENTS.md)).
 - Document storage TTL policy, inactivity expiry risks, and keep-alive entry

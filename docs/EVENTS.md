@@ -379,6 +379,22 @@ Emitted by `clear_max_rate` when an admin removes the per-second rate ceiling.
 After this event, `create_stream` and `modify_rate` accept any positive rate
 again, the same as if `set_max_rate` had never been called.
 
+### `mindur`
+
+Emitted by `set_min_duration` when an admin changes the shortest stream
+lifetime — the shortest time to depletion — accepted by `create_stream` and
+`modify_rate`.
+
+| | |
+|---|---|
+| Topics | `("mindur",)` |
+| Data | `min_duration: u64` (the new minimum, in seconds; `0` disables the check) |
+
+A stream whose deposit would drain in fewer than this many seconds is rejected
+with `StreamTooShort`, a code distinct from `InvalidAmount`. Until an admin
+sets a value, the event never appears and the minimum is `0` (no floor), so the
+check is skipped entirely.
+
 ### `regset`
 
 Emitted by `set_registry` when an admin points the vault at an NGO registry

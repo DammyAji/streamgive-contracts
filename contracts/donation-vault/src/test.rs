@@ -1019,6 +1019,8 @@ fn get_config_reflects_admin_settings() {
             fee_bps: 0,
             min_deposit: 0,
             max_streams_per_donor: 100,
+            max_rate: None,
+            min_duration: 0,
             registry: None,
             cancel_grace_ledgers: 0,
             total_donated: 0,
@@ -1048,6 +1050,7 @@ fn get_config_reflects_admin_settings() {
             min_deposit: 100,
             max_streams_per_donor: 50,
             max_rate: None,
+            min_duration: 0,
             registry: None, // configured after the stream operations below
             cancel_grace_ledgers: 10,
             total_donated: 0,
@@ -2802,6 +2805,151 @@ fn clear_max_rate_publishes_event() {
     s.client.clear_max_rate();
 
     assert_last_event(&s.env, (symbol_short!("maxrtclr"),), ());
+}
+
+// =============================================================================
+// Issue #340: optional minimum stream duration (shortest time to depletion)
+// =============================================================================
+
+#[test]
+fn min_duration_defaults_to_zero() {
+    let s = setup();
+    assert_eq!(s.client.min_duration(), 0);
+    assert_eq!(s.client.get_config().min_duration, 0);
+}
+
+#[test]
+fn min_duration_is_exposed_through_get_config() {
+    let s = setup();
+
+    s.client.set_min_duration(&60);
+    assert_eq!(s.client.min_duration(), 60);
+    assert_eq!(s.client.get_config().min_duration, 60);
+
+    // Zero is the documented "no minimum" sentinel.
+    s.client.set_min_duration(&0);
+    assert_eq!(s.client.min_duration(), 0);
+    assert_eq!(s.client.get_config().min_duration, 0);
+}
+
+#[test]
+fn non_admin_cannot_set_min_duration() {
+    let s = setup();
+    s.env.mock_auths(&[]);
+    assert!(s.client.try_set_min_duration(&60).is_err());
+}
+
+#[test]
+fn create_stream_enforces_min_duration_boundary() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &10_000);
+    s.client.set_min_duration(&60);
+
+    // Boundary: a deposit that lasts exactly the minimum (600 / 10 = 60 s)
+    // is accepted.
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &600, &10);
+    assert_eq!(s.client.get_stream(&stream_id).rate, 10);
+
+    // Ceiling: 591 / 10 lasts 60 s when rounded up, so it is still accepted.
+    let second = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &591, &10);
+    assert_eq!(s.client.get_stream(&second).balance, 591);
+
+    // One second short (590 / 10 = 59 s) is rejected, and no deposit is pulled.
+    let balance_before = s.token.balance(&s.donor);
+    assert_eq!(
+        s.client
+            .try_create_stream(&s.donor, &s.ngo, &s.token.address, &590, &10),
+        Err(Ok(Error::StreamTooShort))
+    );
+    assert_eq!(s.token.balance(&s.donor), balance_before);
+}
+
+#[test]
+fn create_stream_min_duration_error_is_distinct_from_invalid_amount() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    s.client.set_min_duration(&60);
+
+    // A positive deposit and rate that merely drain too fast are reported as
+    // StreamTooShort, not InvalidAmount.
+    assert_eq!(
+        s.client
+            .try_create_stream(&s.donor, &s.ngo, &s.token.address, &10, &10),
+        Err(Ok(Error::StreamTooShort))
+    );
+
+    // A zero deposit is still InvalidAmount, leaving the two cases distinct.
+    assert_eq!(
+        s.client
+            .try_create_stream(&s.donor, &s.ngo, &s.token.address, &0, &10),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+#[test]
+fn create_stream_rejects_unmeetable_min_duration_without_overflow() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    s.client.set_min_duration(&u64::MAX);
+
+    // No representable deposit can meet the floor; the checked multiply must
+    // report StreamTooShort rather than overflow.
+    assert_eq!(
+        s.client
+            .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &1),
+        Err(Ok(Error::StreamTooShort))
+    );
+}
+
+#[test]
+fn modify_rate_enforces_min_duration_boundary() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.set_min_duration(&60);
+
+    // Boundary: at the new rate the remaining 1_000 lasts 63 s (ceil), so it
+    // is accepted.
+    s.client.modify_rate(&stream_id, &16);
+    assert_eq!(s.client.get_stream(&stream_id).rate, 16);
+
+    // One step faster drains in 59 s, so it is rejected and the stored rate
+    // and balance are left unchanged.
+    assert_eq!(
+        s.client.try_modify_rate(&stream_id, &17),
+        Err(Ok(Error::StreamTooShort))
+    );
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.rate, 16);
+    assert_eq!(stream.balance, 1_000);
+}
+
+#[test]
+fn zero_min_duration_disables_the_check() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &10);
+    s.client.set_min_duration(&0);
+
+    // With the floor disabled, a one-second stream is allowed.
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1, &1);
+    assert_eq!(s.client.get_stream(&stream_id).rate, 1);
+}
+
+#[test]
+fn set_min_duration_publishes_event() {
+    let s = setup();
+
+    s.client.set_min_duration(&60);
+
+    assert_last_event(&s.env, (symbol_short!("mindur"),), 60u64);
 }
 
 // =============================================================================
