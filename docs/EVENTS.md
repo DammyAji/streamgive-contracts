@@ -25,7 +25,7 @@ layout stable. Event type names include `RegisterEvent`, `RenamedEvent`,
 `UpgradedEvent`, `UpgradeProposedEvent`, `UpgradeCancelledEvent`,
 `UpgradeDelaySetEvent`, `ApproverAddedEvent`, `ApproverRemovedEvent`,
 `CreatedEvent`, `WithdrawnEvent`, `CancelledStreamEvent`, `RescuedStreamEvent`,
-`ToppedUpEvent`, and `RateModifiedEvent`.
+`ToppedUpEvent`, `RateModifiedEvent`, and `SurplusSweptEvent`.
 
 `Address`, `i128`, `u64`, `u32`, `bool`, and `String` are the standard
 Soroban SDK/XDR types (`Address` is the SDK's account/contract address
@@ -422,6 +422,22 @@ timelock lasts.
 |---|---|
 | Topics | `("updelay",)` |
 | Data | `delay: u64` (the new delay in seconds; `0` disables the timelock) |
+
+### `sweep`
+
+Emitted by `sweep_surplus` when an admin moves tokens that were sent to the
+vault by mistake to the treasury.
+
+| | |
+|---|---|
+| Topics | `("sweep", token: Address)` |
+| Data | `(amount: i128, treasury: Address)` |
+
+`amount` never exceeds the surplus above the token's committed balance (the sum
+of stream balances the vault holds), so a sweep can never touch funds belonging
+to streams. `treasury` is the payout address the surplus went to. An indexer can
+reconstruct the recoverable surplus at any time as the vault's token balance
+minus `committed_balance(token)` (#346).
 
 ### `created`
 

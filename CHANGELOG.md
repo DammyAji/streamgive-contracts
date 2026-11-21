@@ -117,6 +117,23 @@ This project does not yet follow a formal versioning scheme — each contract's
   and `pending_upgrade()` expose the configured delay and the pending proposal.
   Donors holding open streams now get a warning window before the bytecode
   changes (#343).
+- `donation-vault`: the vault now tracks a committed balance per token — the sum
+  of stream balances it holds on behalf of streams — kept in step by every
+  fund-moving path (`create_stream` / `top_up` add, `withdraw`,
+  `withdraw_batch`, `cancel_stream`, `rescue_stream`, `modify_rate`,
+  `pause_stream`, `resume_stream` and `transfer_stream` subtract). Admin-gated
+  `sweep_surplus(token, amount)` moves only the surplus above that committed
+  balance to the treasury, so tokens sent to the vault by mistake can be
+  recovered without ever touching stream funds; it emits `sweep` and fails with
+  `Error::NoTreasury` (no treasury configured) or
+  `Error::SweepExceedsSurplus` (more than the surplus). Read-only
+  `committed_balance()` and `surplus()` expose the two figures (#346).
+  Storage note: `DataKey::CommittedBalance` is a new key, so it is absent (zero)
+  on any pre-existing deployment. Upgrading a vault that already holds open
+  streams therefore requires a one-time backfill of each token's committed
+  balance (the sum of its streams' `balance`) before `sweep_surplus` is used, or
+  the whole token balance would read as sweepable surplus. No such deployment
+  exists yet, so no migration entry point is added.
 
 ### Changed
 

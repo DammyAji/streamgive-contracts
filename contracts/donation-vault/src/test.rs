@@ -4069,6 +4069,189 @@ fn upgrade_allowed_once_timelock_disabled() {
 }
 
 // =============================================================================
+// committed balance and surplus sweep (issue #346)
+// =============================================================================
+
+#[test]
+fn committed_balance_tracks_deposits_and_accrued_withdrawals() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    assert_eq!(s.client.committed_balance(&s.token.address), 0);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // The whole deposit is committed to the stream.
+    assert_eq!(s.client.committed_balance(&s.token.address), 1_000);
+    assert_eq!(s.token.balance(&s.client.address), 1_000);
+    assert_eq!(s.client.surplus(&s.token.address), 0);
+
+    // 40 seconds accrue 400, all of which leaves the vault on withdrawal.
+    s.env.ledger().with_mut(|l| l.timestamp += 40);
+    s.client.withdraw(&stream_id);
+
+    assert_eq!(s.client.committed_balance(&s.token.address), 600);
+    assert_eq!(s.token.balance(&s.client.address), 600);
+    assert_eq!(s.client.surplus(&s.token.address), 0);
+}
+
+#[test]
+fn committed_balance_tracks_top_ups() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_500);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.committed_balance(&s.token.address), 1_000);
+
+    s.client.top_up(&stream_id, &500);
+
+    assert_eq!(s.client.committed_balance(&s.token.address), 1_500);
+    assert_eq!(s.client.surplus(&s.token.address), 0);
+}
+
+#[test]
+fn committed_balance_drops_when_stream_is_cancelled() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.committed_balance(&s.token.address), 1_000);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 20); // 200 accrues, 800 refunds
+    s.client.cancel_stream(&stream_id);
+
+    // Both the settled payout and the refund left the vault.
+    assert_eq!(s.client.committed_balance(&s.token.address), 0);
+    assert_eq!(s.client.surplus(&s.token.address), 0);
+}
+
+#[test]
+fn surplus_reflects_tokens_sent_to_the_vault_by_mistake() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_500);
+
+    let _stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // 500 strays into the vault without a stream backing it.
+    s.token.transfer(&s.donor, &s.client.address, &500);
+
+    assert_eq!(s.client.committed_balance(&s.token.address), 1_000);
+    assert_eq!(s.client.surplus(&s.token.address), 500);
+}
+
+#[test]
+fn sweep_surplus_moves_only_the_surplus_and_publishes_event() {
+    let s = setup();
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+
+    s.token_admin.mint(&s.donor, &1_500);
+    let _stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.token.transfer(&s.donor, &s.client.address, &500);
+
+    let swept = s.client.try_sweep_surplus(&s.token.address, &500);
+    assert!(swept.is_ok());
+
+    assert_last_event(
+        &s.env,
+        (symbol_short!("sweep"), s.token.address.clone()),
+        (500i128, treasury.clone()),
+    );
+
+    // The treasury got the surplus; the stream's committed funds are intact.
+    assert_eq!(s.token.balance(&treasury), 500);
+    assert_eq!(s.token.balance(&s.client.address), 1_000);
+    assert_eq!(s.client.committed_balance(&s.token.address), 1_000);
+    assert_eq!(s.client.surplus(&s.token.address), 0);
+}
+
+#[test]
+fn sweep_surplus_can_never_touch_stream_funds() {
+    let s = setup();
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+
+    s.token_admin.mint(&s.donor, &1_400);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    // Only 400 is surplus.
+    s.token.transfer(&s.donor, &s.client.address, &400);
+
+    // Asking for one more than the surplus is rejected outright.
+    let result = s.client.try_sweep_surplus(&s.token.address, &401);
+    assert_eq!(result, Err(Ok(Error::SweepExceedsSurplus)));
+
+    // Even the whole vault balance — stream funds included — is rejected.
+    let result = s.client.try_sweep_surplus(&s.token.address, &1_400);
+    assert_eq!(result, Err(Ok(Error::SweepExceedsSurplus)));
+
+    // Sweeping the surplus leaves exactly the streams' 1_000 committed.
+    s.client.sweep_surplus(&s.token.address, &400);
+    assert_eq!(s.token.balance(&s.client.address), 1_000);
+
+    // And the NGO can still draw down the full committed amount.
+    s.env.ledger().with_mut(|l| l.timestamp += 100);
+    s.client.withdraw(&stream_id);
+    assert_eq!(s.token.balance(&s.ngo), 1_000);
+    assert_eq!(s.client.committed_balance(&s.token.address), 0);
+}
+
+#[test]
+fn sweep_surplus_requires_a_treasury() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_100);
+    s.token.transfer(&s.donor, &s.client.address, &100);
+
+    let result = s.client.try_sweep_surplus(&s.token.address, &100);
+    assert_eq!(result, Err(Ok(Error::NoTreasury)));
+}
+
+#[test]
+fn sweep_surplus_rejects_non_positive_amount() {
+    let s = setup();
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+
+    let result = s.client.try_sweep_surplus(&s.token.address, &0);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+
+    let result = s.client.try_sweep_surplus(&s.token.address, &-1);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn sweep_surplus_requires_admin() {
+    let s = setup();
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+
+    s.env.mock_auths(&[]);
+    assert!(s.client.try_sweep_surplus(&s.token.address, &1).is_err());
+}
+
+#[test]
+fn sweep_surplus_rejected_while_paused() {
+    let s = setup();
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.pause();
+
+    let result = s.client.try_sweep_surplus(&s.token.address, &1);
+    assert_eq!(result, Err(Ok(Error::ContractPaused)));
+}
+
+// =============================================================================
 // rescue_stream tests (issue #286)
 // =============================================================================
 
