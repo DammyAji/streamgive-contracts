@@ -1,0 +1,18 @@
+{
+  "version": "0.2",
+  "language": "en",
+  "words": [
+    "Soroban",
+    "stellar",
+    "wasm",
+    "ngo",
+    "StreamGive",
+    "clippy",
+    "rustfmt",
+    "stroops",
+    "cargo",
+    "testnet",
+    "mainnet"
+  ],
+  "ignorePaths": ["target/**", "node_modules/**"]
+}
