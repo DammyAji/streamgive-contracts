@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -59,7 +62,7 @@ jobs:
         run: cargo test --workspace --release
 
       - name: Detect unused dependencies
-        uses: bnjbvr/cargo-machete@main
+        uses: bnjbvr/cargo-machete@431e75731b681a69a4cfdeb1315b505778bb5c70 # v0.10.1
 
       - name: Hash and upload wasm artifacts
         if: github.ref == 'refs/heads/main'
