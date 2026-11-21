@@ -103,6 +103,18 @@ pub struct Ngo {
     pub verified: bool,
 }
 
+/// A single page of the NGO owners index, returned by `list_ngos_page`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NgoOwnerPage {
+    /// The owner addresses in this page, in registry order.
+    pub owners: Vec<Address>,
+    /// The `start` to pass on the next call: one past the end of this page,
+    /// clamped to the current owner count. Iteration is complete once it
+    /// reaches `total_ngos()` (or `ngo_count()`).
+    pub next: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub enum DataKey {
@@ -125,6 +137,9 @@ pub enum DataKey {
     IndexByOwner(Address),
     /// Addresses (other than the admin) permitted to approve and revoke NGOs.
     Approvers,
+    /// Current number of verified NGO records, maintained by the review and
+    /// removal entry points and read by `verified_count`.
+    VerifiedCount,
 }
 
 #[contracterror]
@@ -169,8 +184,9 @@ pub enum Error {
 /// Note: this is strictly a byte limit (200 bytes), not a character limit.
 pub const MAX_NGO_NAME_LEN: u32 = 200;
 
-/// Maximum number of NGO owners returned by `list_ngos` in a single page.
-/// Caps read footprint, memory, and gas consumption to keep pagination bounded.
+/// Maximum number of NGO owners returned by `list_ngos` / `list_ngos_page` in
+/// a single page. Caps read footprint, memory, and gas consumption to keep
+/// pagination bounded.
 pub const MAX_LIST_LIMIT: u32 = 50;
 
 /// Approximate ledgers per day at a 5-second close time. Used to express
@@ -222,6 +238,19 @@ fn set_owner_count(env: &Env, count: u32) {
     env.storage()
         .instance()
         .set(&DataKey::OwnerIndexCount, &count);
+}
+
+fn get_verified_count(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::VerifiedCount)
+        .unwrap_or(0)
+}
+
+fn set_verified_count(env: &Env, count: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::VerifiedCount, &count);
 }
 
 /// Returns whether a code point is an invisible or format character (category Cf).
@@ -359,6 +388,11 @@ fn approve_registered_ngo(env: &Env, ngo_owner: Address) -> Result<(), Error> {
     }
     ngo.verified = true;
     env.storage().persistent().set(&key, &ngo);
+
+    let verified = get_verified_count(env);
+    let new_verified = verified.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+    set_verified_count(env, new_verified);
+
     extend_instance_ttl(env);
     extend_ngo_ttl(env, &ngo_owner);
 
@@ -372,11 +406,13 @@ fn approve_registered_ngo(env: &Env, ngo_owner: Address) -> Result<(), Error> {
 }
 
 /// Deletes an NGO's registry entry and its position in the owners index,
-/// shrinking the live counts. Shared by `unregister` (owner-initiated) and
-/// `remove_ngo` (admin-initiated); the caller is responsible for authorizing
-/// the call and for the verified/unverified check. Does not touch the
-/// instance TTL — the caller decides whether to bump it. Decrements `NgoCount`
-/// using checked subtraction, returning `Error::ArithmeticOverflow` on underflow.
+/// shrinking the live counts. Shared by `unregister` (owner-initiated),
+/// `remove_ngo` (admin-initiated) and `reject_ngo` (reviewer-initiated); the
+/// caller is responsible for authorizing the call and for the
+/// verified/unverified check. Does not touch the instance TTL — the caller
+/// decides whether to bump it. Decrements `NgoCount`, and `VerifiedCount` when
+/// the entry being removed was verified, using checked subtraction and
+/// returning `Error::ArithmeticOverflow` on underflow.
 fn delete_ngo_entry(env: &Env, owner: &Address) -> Result<(), Error> {
     let count: u64 = env
         .storage()
@@ -384,6 +420,19 @@ fn delete_ngo_entry(env: &Env, owner: &Address) -> Result<(), Error> {
         .get(&DataKey::NgoCount)
         .unwrap_or(0);
     let new_ngo_count = count.checked_sub(1).ok_or(Error::ArithmeticOverflow)?;
+
+    // Keep `verified_count` in step with the entry being removed.
+    if let Some(ngo) = env
+        .storage()
+        .persistent()
+        .get::<_, Ngo>(&DataKey::Ngo(owner.clone()))
+    {
+        if ngo.verified {
+            let verified = get_verified_count(env);
+            let new_verified = verified.checked_sub(1).ok_or(Error::ArithmeticOverflow)?;
+            set_verified_count(env, new_verified);
+        }
+    }
 
     env.storage()
         .persistent()
@@ -1046,6 +1095,67 @@ impl NgoRegistry {
         owners
     }
 
+    /// Returns one page of registered NGO owner addresses together with the
+    /// index to use for the following page.
+    ///
+    /// Same `start`/`limit` semantics, ordering, and `MAX_LIST_LIMIT` cap as
+    /// `list_ngos`, but instead of leaving callers to recompute the cursor it
+    /// also returns `next`, the `start` for the next call. Because `next`
+    /// reaches the total owner count on the final page, a caller can tell the
+    /// end of the list apart from a full page without a follow-up call.
+    ///
+    /// `next` is the exclusive end of this page (one past its last owner),
+    /// clamped to the owner count. Iteration is complete once
+    /// `next >= total_ngos()`. An out-of-range `start` or a `limit == 0`
+    /// returns an empty `owners` and `next` equal to the owner count, so the
+    /// caller stops immediately.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env, String};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryArgs, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let admin = Address::generate(&env);
+    /// # let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// let owner = Address::generate(&env);
+    /// client.register(&owner, &String::from_str(&env, "Example NGO"));
+    ///
+    /// let page = client.list_ngos_page(&0, &10);
+    /// assert_eq!(page.owners.get(0).unwrap(), owner);
+    /// assert_eq!(page.next, 1);
+    /// ```
+    pub fn list_ngos_page(env: Env, start: u32, limit: u32) -> NgoOwnerPage {
+        let count = get_owner_count(&env);
+        if start >= count || limit == 0 {
+            return NgoOwnerPage {
+                owners: Vec::new(&env),
+                next: count,
+            };
+        }
+
+        let effective_limit = limit.min(MAX_LIST_LIMIT);
+        let end = start
+            .checked_add(effective_limit)
+            .unwrap_or(count)
+            .min(count);
+
+        let mut owners = Vec::new(&env);
+        for index in start..end {
+            if let Some(owner) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::OwnerByIndex(index))
+            {
+                owners.push_back(owner);
+            }
+        }
+
+        NgoOwnerPage { owners, next: end }
+    }
+
     /// Changes the name on an NGO's own pending application, so a typo or
     /// rename can be fixed without going through an admin. Requires the
     /// owner's auth. Fails with `Error::NotRegistered` for an address with
@@ -1184,6 +1294,34 @@ impl NgoRegistry {
             .unwrap_or(0)
     }
 
+    /// Returns how many registered NGO entries are currently verified.
+    ///
+    /// Backed by a single stored counter, kept in step by `approve_ngo` /
+    /// `batch_approve` (increment), `revoke_ngo` (decrement), and removal of a
+    /// verified entry (decrement), so a dashboard can read the verified tally
+    /// without listing and filtering every entry.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env, String};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryArgs, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let admin = Address::generate(&env);
+    /// # let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// let owner = Address::generate(&env);
+    /// client.register(&owner, &String::from_str(&env, "Example NGO"));
+    /// assert_eq!(client.verified_count(), 0);
+    ///
+    /// client.approve_ngo(&admin, &owner);
+    /// assert_eq!(client.verified_count(), 1);
+    /// ```
+    pub fn verified_count(env: Env) -> u64 {
+        get_verified_count(&env)
+    }
+
     /// Marks a registered NGO as verified. Callable by the admin or a listed
     /// approver; `approver` names the acting address and must have authorized
     /// the call (see `add_approver`). Fails with
@@ -1295,6 +1433,11 @@ impl NgoRegistry {
         }
         ngo.verified = false;
         env.storage().persistent().set(&key, &ngo);
+
+        let verified = get_verified_count(&env);
+        let new_verified = verified.checked_sub(1).ok_or(Error::ArithmeticOverflow)?;
+        set_verified_count(&env, new_verified);
+
         extend_instance_ttl(&env);
         extend_ngo_ttl(&env, &ngo_owner);
 

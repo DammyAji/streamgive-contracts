@@ -1203,6 +1203,230 @@ fn list_ngos_unregister_last_and_only_entry() {
 }
 
 // =============================================================================
+// list_ngos_page (issue #351)
+// =============================================================================
+
+#[test]
+fn list_ngos_page_first_page_returns_next_start() {
+    let (env, client, _admin) = setup();
+    let mut owners = soroban_sdk::vec![&env];
+    for _ in 0..5 {
+        let owner = Address::generate(&env);
+        client.register(&owner, &String::from_str(&env, "NGO"));
+        owners.push_back(owner);
+    }
+
+    let page = client.list_ngos_page(&0, &2);
+
+    assert_eq!(page.owners.len(), 2);
+    assert_eq!(page.owners.get(0).unwrap(), owners.get(0).unwrap());
+    assert_eq!(page.owners.get(1).unwrap(), owners.get(1).unwrap());
+    assert_eq!(page.next, 2);
+}
+
+#[test]
+fn list_ngos_page_last_page_next_reaches_total() {
+    let (env, client, _admin) = setup();
+    let mut owners = soroban_sdk::vec![&env];
+    for _ in 0..5 {
+        let owner = Address::generate(&env);
+        client.register(&owner, &String::from_str(&env, "NGO"));
+        owners.push_back(owner);
+    }
+
+    // Final, short page: one owner left and `next` lands on the total, so the
+    // end of the list is distinguishable from a page that merely looks short.
+    let page = client.list_ngos_page(&4, &2);
+
+    assert_eq!(page.owners.len(), 1);
+    assert_eq!(page.owners.get(0).unwrap(), owners.get(4).unwrap());
+    assert_eq!(page.next, client.total_ngos());
+}
+
+#[test]
+fn list_ngos_page_full_final_page_next_reaches_total() {
+    let (env, client, _admin) = setup();
+    for _ in 0..4 {
+        let owner = Address::generate(&env);
+        client.register(&owner, &String::from_str(&env, "NGO"));
+    }
+
+    // A page that exactly fills the limit can still be the last: `next` hits
+    // the total, so the caller needs no extra (empty) call to discover the end.
+    let page = client.list_ngos_page(&2, &2);
+
+    assert_eq!(page.owners.len(), 2);
+    assert_eq!(page.next, client.total_ngos());
+}
+
+#[test]
+fn list_ngos_page_out_of_range_start_returns_empty_with_total() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "NGO"));
+
+    let page = client.list_ngos_page(&10, &5);
+
+    assert_eq!(page.owners.len(), 0);
+    assert_eq!(page.owners, Vec::new(&env));
+    assert_eq!(page.next, client.total_ngos());
+}
+
+#[test]
+fn list_ngos_page_empty_registry_returns_total_zero() {
+    let (_env, client, _admin) = setup();
+
+    let page = client.list_ngos_page(&0, &10);
+
+    assert_eq!(page.owners.len(), 0);
+    assert_eq!(page.next, 0);
+}
+
+#[test]
+fn list_ngos_page_walks_whole_index_via_next() {
+    let (env, client, _admin) = setup();
+    let mut owners = soroban_sdk::vec![&env];
+    for _ in 0..7 {
+        let owner = Address::generate(&env);
+        client.register(&owner, &String::from_str(&env, "NGO"));
+        owners.push_back(owner);
+    }
+
+    // Follow `next` to the end; every owner is visited exactly once, in order.
+    let mut seen = soroban_sdk::vec![&env];
+    let mut start = 0u32;
+    loop {
+        let page = client.list_ngos_page(&start, &3);
+        for i in 0..page.owners.len() {
+            seen.push_back(page.owners.get(i).unwrap());
+        }
+        start = page.next;
+        if start >= client.total_ngos() {
+            break;
+        }
+    }
+
+    assert_eq!(seen, owners);
+}
+
+// =============================================================================
+// verified_count (issue #352)
+// =============================================================================
+
+#[test]
+fn verified_count_starts_at_zero() {
+    let (_env, client, _admin) = setup();
+
+    assert_eq!(client.verified_count(), 0);
+}
+
+#[test]
+fn verified_count_increments_on_approve() {
+    let (env, client, admin) = setup();
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.register(&a, &String::from_str(&env, "A"));
+    client.register(&b, &String::from_str(&env, "B"));
+
+    client.approve_ngo(&admin, &a);
+    assert_eq!(client.verified_count(), 1);
+    client.approve_ngo(&admin, &b);
+    assert_eq!(client.verified_count(), 2);
+}
+
+#[test]
+fn verified_count_tracks_batch_approve() {
+    let (env, client, admin) = setup();
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let c = Address::generate(&env);
+    client.register(&a, &String::from_str(&env, "A"));
+    client.register(&b, &String::from_str(&env, "B"));
+    client.register(&c, &String::from_str(&env, "C"));
+
+    client.batch_approve(&admin, &vec![&env, a, b, c]);
+
+    assert_eq!(client.verified_count(), 3);
+}
+
+#[test]
+fn verified_count_decrements_on_revoke() {
+    let (env, client, admin) = setup();
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.register(&a, &String::from_str(&env, "A"));
+    client.register(&b, &String::from_str(&env, "B"));
+    client.approve_ngo(&admin, &a);
+    client.approve_ngo(&admin, &b);
+
+    client.revoke_ngo(&admin, &a);
+    assert_eq!(client.verified_count(), 1);
+    client.revoke_ngo(&admin, &b);
+    assert_eq!(client.verified_count(), 0);
+}
+
+#[test]
+fn verified_count_unaffected_by_removing_an_unverified_ngo() {
+    let (env, client, admin) = setup();
+    let verified = Address::generate(&env);
+    let pending = Address::generate(&env);
+    client.register(&verified, &String::from_str(&env, "Verified"));
+    client.register(&pending, &String::from_str(&env, "Pending"));
+    client.approve_ngo(&admin, &verified);
+
+    // Admin removal and owner-initiated unregister both drop unverified
+    // entries only, so the verified tally is untouched.
+    client.remove_ngo(&pending);
+    assert_eq!(client.verified_count(), 1);
+
+    let other = Address::generate(&env);
+    client.register(&other, &String::from_str(&env, "Other"));
+    client.unregister(&other);
+    assert_eq!(client.verified_count(), 1);
+}
+
+#[test]
+fn verified_count_decrements_when_a_verified_ngo_is_removed() {
+    let (env, client, admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+    assert_eq!(client.verified_count(), 1);
+
+    // No public entry point removes a verified NGO — unregister, remove_ngo and
+    // reject_ngo all refuse it — so drive the shared delete helper directly to
+    // prove it keeps the counter honest.
+    env.as_contract(&client.address, || {
+        delete_ngo_entry(&env, &owner).unwrap();
+    });
+
+    assert_eq!(client.verified_count(), 0);
+    assert_eq!(client.ngo_count(), 0);
+}
+
+#[test]
+fn removing_a_verified_ngo_is_rejected_and_leaves_count_unchanged() {
+    let (env, client, admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+
+    assert_eq!(
+        client.try_remove_ngo(&owner),
+        Err(Ok(Error::AlreadyVerified))
+    );
+    assert_eq!(
+        client.try_unregister(&owner),
+        Err(Ok(Error::AlreadyVerified))
+    );
+    assert_eq!(
+        client.try_reject_ngo(&admin, &owner, &1),
+        Err(Ok(Error::AlreadyVerified))
+    );
+    assert_eq!(client.verified_count(), 1);
+}
+
+// =============================================================================
 // register and unregister auth and events (issue #294)
 // =============================================================================
 
@@ -1903,22 +2127,24 @@ fn reject_ngo_removes_pending_entry_and_emits_event() {
 
     client.reject_ngo(&admin, &owner, &reason_code);
 
-    assert_eq!(client.try_get_ngo(&owner), Err(Ok(Error::NotRegistered)));
-    assert!(!client.is_verified(&owner));
-    assert_eq!(client.total_ngos(), 0);
-    assert_eq!(client.list_ngos(&0, &10).len(), 0);
     // Events are cleared per top-level call, so only the rejected event shows.
+    // Assert before the state reads below, which would reset the buffer.
     assert_eq!(
         env.events().all(),
         vec![
             &env,
             (
                 client.address.clone(),
-                (symbol_short!("rejected"), owner).into_val(&env),
+                (symbol_short!("rejected"), owner.clone()).into_val(&env),
                 reason_code.into_val(&env),
             ),
         ]
     );
+
+    assert_eq!(client.try_get_ngo(&owner), Err(Ok(Error::NotRegistered)));
+    assert!(!client.is_verified(&owner));
+    assert_eq!(client.total_ngos(), 0);
+    assert_eq!(client.list_ngos(&0, &10).len(), 0);
 }
 
 #[test]
