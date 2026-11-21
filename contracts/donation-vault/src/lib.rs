@@ -61,6 +61,18 @@ pub struct WithdrawnEvent {
     pub payout: Address,
 }
 
+/// Emitted once when a stream's balance reaches zero and its status becomes
+/// `Drained` (issue #344). Carries the stream id and the cumulative amount
+/// paid to the NGO over the stream's life, so an indexer can mark the stream
+/// finished without recomputing the transition from `withdraw` events.
+#[contractevent(topics = ["drained"], data_format = "vec")]
+pub struct DrainedEvent {
+    #[topic]
+    pub stream_id: u64,
+    /// The stream's `withdrawn` total at the moment it emptied.
+    pub total_paid: i128,
+}
+
 #[contractevent(topics = ["cancel"], data_format = "vec")]
 pub struct CancelledStreamEvent {
     #[topic]
@@ -902,7 +914,13 @@ fn accrual_base(stream: &Stream) -> u64 {
 /// This is shared by every operation that changes a stream's balance or rate
 /// so payout accounting, checked arithmetic, and the checkpoint timestamp
 /// cannot drift between entry points.
-fn settle(env: &Env, stream: &mut Stream, now: u64) -> Result<i128, Error> {
+///
+/// It marks an emptied Active stream `Drained` but does **not** emit the
+/// `drained` event itself: `cancel_stream` and `top_up` reuse this to settle a
+/// stream they are about to reclassify (Cancelled / Active), so the "ran to
+/// completion" event would be spurious for them. Every other caller goes
+/// through the [`settle`] wrapper, which announces the transition (issue #344).
+fn settle_core(env: &Env, stream: &mut Stream, now: u64) -> Result<i128, Error> {
     let accrued = if stream.status == StreamStatus::Paused {
         0
     } else {
@@ -933,6 +951,22 @@ fn settle(env: &Env, stream: &mut Stream, now: u64) -> Result<i128, Error> {
         pay_ngo(env, &token_client, &stream.ngo, accrued);
     }
 
+    Ok(accrued)
+}
+
+/// Settles a stream and, if that emptied it, publishes the `drained` event
+/// (issue #344). Wraps [`settle_core`] so every settle-driven drain announces
+/// the transition exactly once, from the same place the status flips.
+fn settle(env: &Env, stream_id: u64, stream: &mut Stream, now: u64) -> Result<i128, Error> {
+    let was_active = stream.status == StreamStatus::Active;
+    let accrued = settle_core(env, stream, now)?;
+    if was_active && stream.status == StreamStatus::Drained {
+        DrainedEvent {
+            stream_id,
+            total_paid: stream.withdrawn,
+        }
+        .publish(env);
+    }
     Ok(accrued)
 }
 
@@ -2805,7 +2839,7 @@ impl DonationVault {
         }
 
         let now = env.ledger().timestamp();
-        let settled = settle(&env, &mut stream, now)?;
+        let settled = settle(&env, stream_id, &mut stream, now)?;
         if stream.balance == 0 {
             stream.status = StreamStatus::Drained;
         } else {
@@ -2909,7 +2943,8 @@ impl DonationVault {
 
         record_payout(&mut stream, accrued)?;
         stream.last_update = now;
-        if stream.balance == 0 {
+        let drained = stream.balance == 0;
+        if drained {
             stream.status = StreamStatus::Drained;
         }
         env.storage().persistent().set(&key, &stream);
@@ -2933,6 +2968,16 @@ impl DonationVault {
             payout,
         }
         .publish(&env);
+
+        // Announce the terminal transition after the payout and `withdraw`
+        // event, so an indexer observes them in order (issue #344).
+        if drained {
+            DrainedEvent {
+                stream_id,
+                total_paid: stream.withdrawn,
+            }
+            .publish(&env);
+        }
 
         Ok(net)
     }
@@ -3011,6 +3056,10 @@ impl DonationVault {
         let mut net_payouts: Map<Address, i128> = Map::new(&env);
         let mut fee_payouts: Map<Address, i128> = Map::new(&env);
         let mut gross_payouts: Map<Address, i128> = Map::new(&env);
+        // Streams this batch empties, mapped to the water mark of their
+        // cumulative payout, so the `drained` event can be published after the
+        // transfers alongside each `withdraw` (issue #344).
+        let mut drained_totals: Map<u64, i128> = Map::new(&env);
         let mut total_accrued: i128 = 0;
 
         for stream_id in stream_ids.iter() {
@@ -3062,6 +3111,7 @@ impl DonationVault {
             stream.last_update = now;
             if stream.balance == 0 {
                 stream.status = StreamStatus::Drained;
+                drained_totals.set(stream_id, stream.withdrawn);
             }
             env.storage().persistent().set(&key, &stream);
             extend_stream_ttl(&env, stream_id);
@@ -3166,6 +3216,16 @@ impl DonationVault {
                     payout: payout.clone(),
                 }
                 .publish(&env);
+
+                // Follow the `withdraw` for any stream this batch emptied,
+                // matching `withdraw`'s withdraw-then-drained order (#344).
+                if let Some(total_paid) = drained_totals.get(stream_id) {
+                    DrainedEvent {
+                        stream_id,
+                        total_paid,
+                    }
+                    .publish(&env);
+                }
             }
         }
 
@@ -3317,7 +3377,7 @@ impl DonationVault {
         }
 
         let now = env.ledger().timestamp();
-        let accrued = settle(&env, &mut stream, now)?;
+        let accrued = settle_core(&env, &mut stream, now)?;
 
         let refund = stream.balance;
 
@@ -3526,7 +3586,7 @@ impl DonationVault {
         let token_client = token::Client::new(&env, &stream.token);
 
         let now = env.ledger().timestamp();
-        let settled = settle(&env, &mut stream, now)?;
+        let settled = settle_core(&env, &mut stream, now)?;
 
         // Update state before the external token transfer
         stream.balance = stream
@@ -3657,7 +3717,7 @@ impl DonationVault {
         }
 
         let now = env.ledger().timestamp();
-        let settled = settle(&env, &mut stream, now)?;
+        let settled = settle(&env, stream_id, &mut stream, now)?;
         stream.rate = new_rate;
 
         env.storage().persistent().set(&key, &stream);
@@ -3707,7 +3767,7 @@ impl DonationVault {
 
         let old_ngo = stream.ngo.clone();
         let now = env.ledger().timestamp();
-        let settled = settle(&env, &mut stream, now)?;
+        let settled = settle(&env, stream_id, &mut stream, now)?;
         if stream.balance == 0 {
             stream.status = StreamStatus::Drained;
         }

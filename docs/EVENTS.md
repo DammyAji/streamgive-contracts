@@ -25,8 +25,8 @@ layout stable. Event type names include `RegisterEvent`, `RenamedEvent`,
 `UpgradedEvent`, `UpgradeProposedEvent`, `UpgradeCancelledEvent`,
 `UpgradeDelaySetEvent`, `ApproverAddedEvent`, `ApproverRemovedEvent`,
 `MetadataUriSetEvent`, `RenewedEvent`, `VerifyPeriodSetEvent`, `CreatedEvent`,
-`WithdrawnEvent`, `CancelledStreamEvent`, `RescuedStreamEvent`, `ToppedUpEvent`,
-`RateModifiedEvent`, and `SurplusSweptEvent`.
+`WithdrawnEvent`, `DrainedEvent`, `CancelledStreamEvent`, `RescuedStreamEvent`,
+`ToppedUpEvent`, `RateModifiedEvent`, and `SurplusSweptEvent`.
 
 `Address`, `i128`, `u64`, `u32`, `bool`, and `String` are the standard
 Soroban SDK/XDR types (`Address` is the SDK's account/contract address
@@ -542,6 +542,28 @@ address itself. The invariant `accrued = fee + net` holds for every payout.
 
 The `withdraw` entry point returns that same `net` amount, so callers displaying
 the payout receive the exact token units transferred to the NGO.
+
+### `drained`
+
+Emitted once when a stream's balance reaches zero and its status flips to
+`Drained`. It marks the stream as finished for an indexer, which otherwise has
+to recompute the transition from the `withdraw` events (#344).
+
+| | |
+|---|---|
+| Topics | `("drained", stream_id: u64)` |
+| Data | `(total_paid: i128)` |
+
+`total_paid` is the stream's cumulative `withdrawn` total at the moment it
+emptied — the lifetime amount paid to the NGO, not just the final
+withdrawal. It is emitted whenever the drain comes from settling a stream:
+`withdraw`, `withdraw_batch` (one per emptied stream), `modify_rate`,
+`transfer_stream`, and `pause_stream`. For a plain `withdraw` it follows that
+call's `withdraw` event; for the other entry points it is published while the
+stream is settled, so it precedes their own `ratemod` / `transfer` /
+`strmpause` event. `cancel_stream` and `top_up` never emit it — they settle a
+stream only to reclassify it (Cancelled, or reactivated Active), which is not
+a drain.
 
 ### `cancel`
 

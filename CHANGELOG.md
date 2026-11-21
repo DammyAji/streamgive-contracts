@@ -80,6 +80,14 @@ This project does not yet follow a formal versioning scheme — each contract's
   as `cancel_stream` (cliff and paused streams accrue nothing). A drained or
   already-cancelled stream reports `0`. It is the donor's mirror of
   `pending_payout` and never moves funds (#345).
+- `donation-vault`: the `drained` event. When settling a stream empties its
+  balance and flips its status to `Drained`, the vault emits
+  `DrainedEvent { stream_id, total_paid }` — the cumulative amount paid to the
+  NGO over the stream's life. Covers `withdraw`, `withdraw_batch` (once per
+  emptied stream), and the settle-driven `modify_rate`, `transfer_stream`, and
+  `pause_stream` paths. `cancel_stream` and `top_up` settle only to reclassify
+  a stream and stay silent, so an indexer sees the terminal transition once,
+  without recomputing it from `withdraw` events (#344).
 - Contract events for registry and vault state changes (see
   [`docs/EVENTS.md`](docs/EVENTS.md)).
 - Document storage TTL policy, inactivity expiry risks, and keep-alive entry
