@@ -12,7 +12,8 @@
     "stroops",
     "cargo",
     "testnet",
-    "mainnet"
+    "mainnet",
+    "clawback"
   ],
   "ignorePaths": ["target/**", "node_modules/**"]
 }

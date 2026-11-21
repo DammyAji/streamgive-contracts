@@ -44,6 +44,113 @@ Key concepts:
 - Every payout is checkpointed, so `last_update` always marks the last time
   the stream was settled.
 
+## Choosing a rate
+
+`rate` is an amount of the token's **smallest unit per second**, and `deposit`
+uses the same unit. Neither is in whole tokens. Stellar assets have 7 decimal
+places, so one whole token is `10,000,000` smallest units (for XLM, one lumen
+is `10,000,000` stroops). If you forget that scale, or apply it twice, you are
+off by a factor of ten million.
+
+The contract has no idea of months. It only multiplies `rate` by elapsed
+seconds (`min(rate × elapsed, balance)`), so the conversion from "X tokens a
+month" happens in your client, and the client decides what a month is and how
+to round.
+
+### The conversion
+
+```text
+units_per_month = monthly_amount × 10^7          (7-decimal token)
+rate            = floor(units_per_month / seconds_per_month)
+```
+
+`rate` must be a whole number of at least 1, so the division has to round. The
+examples below use a 30-day month, `seconds_per_month = 30 × 86,400 =
+2,592,000`. Pick one convention and use it everywhere: an average calendar
+month (`365.25 × 86,400 / 12 = 2,629,800` seconds) is also fine, but the
+backend, frontend, and any script must agree on it.
+
+Do the whole calculation in integers (`i128`, `BigInt`, `u128`). A
+floating-point `rate` passed through a JSON number can lose precision or end
+up as a fraction the contract cannot accept.
+
+### Worked examples (7-decimal token, 30-day month)
+
+| Monthly amount | `units_per_month` | Exact units/second | `rate` (rounded down) | Paid per 30 days | Shortfall |
+| --- | --- | --- | --- | --- | --- |
+| 10 tokens | `100,000,000` | 38.580… | `38` | `98,496,000` (9.8496 tokens) | 1.504% |
+| 100 tokens | `1,000,000,000` | 385.802… | `385` | `997,920,000` (99.792 tokens) | 0.208% |
+| 1,000 tokens | `10,000,000,000` | 3,858.024… | `3858` | `9,999,936,000` (999.9936 tokens) | 0.00064% |
+
+Step by step, for 10 tokens a month:
+
+1. `10 × 10,000,000 = 100,000,000` units per month.
+2. `100,000,000 / 2,592,000 = 38.580…` units per second.
+3. Round down: `rate = 38`.
+4. Check: `38 × 2,592,000 = 98,496,000` units, or 9.8496 tokens, every 30
+   days. That is 1,504,000 units (0.1504 tokens) less than asked for.
+
+The smaller the monthly amount, the bigger the rounding error, because the
+dropped fraction of a unit per second is a larger share of a small rate. Show
+donors the actual monthly amount, `rate × seconds_per_month`, not the amount
+they typed.
+
+### Rounding down vs. rounding up
+
+Rounding the rate down never streams more than the donor agreed to. The
+deposit just lasts a bit longer. `depletion_time` rounds up to whole seconds
+(`ceil(balance / rate)`), so a deposit of exactly one month's amount runs for:
+
+| Monthly amount | `rate` | Seconds to drain `units_per_month` | Longer than 30 days by |
+| --- | --- | --- | --- |
+| 10 tokens | `38` | `ceil(100,000,000 / 38) = 2,631,579` | 39,579 s (about 11 hours) |
+| 100 tokens | `385` | `ceil(1,000,000,000 / 385) = 2,597,403` | 5,403 s (about 1.5 hours) |
+| 1,000 tokens | `3858` | `ceil(10,000,000,000 / 3858) = 2,592,017` | 17 s |
+
+Rounding up (`rate = 39` for 10 tokens) pays `39 × 2,592,000 = 101,088,000`
+units per 30 days, 1.088% more than asked for, and a one-month deposit drains
+in `ceil(100,000,000 / 39) = 2,564,103` seconds, almost 8 hours early. Use
+round-down unless the donor has agreed to the higher amount.
+
+In the last second of a stream, accrual is capped at the remaining `balance`,
+so the NGO receives exactly the deposit and never a unit more.
+
+### Sizing the deposit
+
+There are two consistent ways to fund a pledge of N months:
+
+- **Exact months:** `deposit = rate × seconds_per_month × N`. For 12 months at
+  `rate = 38` that is `38 × 2,592,000 × 12 = 1,181,952,000` units (118.1952
+  tokens), and the stream drains after exactly `31,104,000` seconds (360 days).
+- **Exact amount:** `deposit = monthly_amount × 10^7 × N`. For 12 months that
+  is `1,200,000,000` units (120 tokens), and the stream runs for
+  `ceil(1,200,000,000 / 38) = 31,578,948` seconds, about 5.5 days longer than
+  360 days.
+
+### The smallest monthly amount
+
+At `rate = 1` a stream pays `2,592,000` units (0.2592 tokens) per 30 days. A
+smaller monthly amount rounds to `rate = 0`, which the vault rejects with
+`Error::InvalidAmount`. A stream cannot carry less than one unit per second,
+so the client should check the minimum and reject a smaller monthly amount
+before it builds the transaction.
+
+### Common mistakes
+
+| Mistake | What gets sent | Result |
+| --- | --- | --- |
+| Passing whole tokens as the deposit | `deposit = 10` for "10 tokens" | Streams 0.000001 tokens. Usually rejected by `min_deposit` with `Error::DepositTooLow` if one is set, otherwise accepted silently. |
+| Dividing whole tokens by seconds | `rate = floor(10 / 2,592,000) = 0` | Rejected with `Error::InvalidAmount`. |
+| Using the monthly amount as the rate | `rate = 100,000,000` | 10 tokens **per second**, 25,920,000 tokens a month. A normal deposit drains in seconds. Rejected with `Error::RateTooHigh` if `max_rate` is set below it, or with `Error::StreamTooShort` if `min_duration` is set, otherwise accepted. |
+
+`min_deposit`, `min_duration`, and `max_rate` are admin-configured guards
+against these mistakes, not a replacement for getting the unit right. When
+they are unset, the vault accepts any positive values.
+
+The rate is gross: if a protocol fee is configured, it is taken out of each
+payout, so the NGO receives slightly less than `rate × elapsed`. See
+[`FEES.md`](./FEES.md).
+
 ## Happy path: create → accrue → withdraw → cancel
 
 ```mermaid

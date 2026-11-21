@@ -12,6 +12,9 @@ For who these contracts defend against, what the admin can and cannot do, and
 which risks are knowingly accepted, see
 [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
+All of the guides in `docs/`, each with a one-line summary, are listed in
+[docs/README.md](docs/README.md).
+
 ## Contracts
 
 - `ngo-registry` — on-chain NGO application, verification, and registry

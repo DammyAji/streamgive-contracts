@@ -2726,3 +2726,88 @@ fn reject_ngo_frees_the_index_and_lets_the_owner_register_again() {
     assert_eq!(client.total_ngos(), 3);
 }
 
+
+/// Names of the `pub fn`s in the `#[contractimpl]` block that opens with
+/// `impl_header`, read from the contract's source. Every one of them is a
+/// public entry point.
+fn entry_point_names<'a>(source: &'a str, impl_header: &str) -> impl Iterator<Item = &'a str> {
+    let mut lines = source.lines();
+    let mut prev = "";
+    for line in lines.by_ref() {
+        if prev.trim() == "#[contractimpl]" && line.trim_end() == impl_header {
+            break;
+        }
+        prev = line;
+    }
+    lines
+        .take_while(|line| line.trim_end() != "}")
+        .filter_map(|line| line.strip_prefix("    pub fn "))
+        .map(|rest| rest.split(['(', '<']).next().unwrap_or(rest).trim())
+}
+
+/// `(function, role)` for each row of the roles table between the `start`
+/// and `end` markers in `docs/ROLES.md`.
+fn role_rows<'a>(
+    doc: &'a str,
+    start: &'a str,
+    end: &'a str,
+) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+    doc.lines()
+        .skip_while(move |line| line.trim() != start)
+        .skip(1)
+        .take_while(move |line| line.trim() != end)
+        .filter(|line| line.starts_with("| `"))
+        .map(|line| {
+            let mut cells = line.split('|').skip(1).map(str::trim);
+            let name = cells.next().unwrap_or("").trim_matches('`');
+            let role = cells.next().unwrap_or("");
+            (name, role)
+        })
+}
+
+/// `docs/ROLES.md` must list every public entry point with the role it
+/// requires, and nothing else. Fails when an entry point is added or renamed
+/// without updating the table, or removed while its row stays behind.
+#[test]
+fn roles_doc_lists_every_entry_point() {
+    const SOURCE: &str = include_str!("lib.rs");
+    const ROLES: &str = include_str!("../../../docs/ROLES.md");
+    const IMPL: &str = "impl NgoRegistry {";
+    const START: &str = "<!-- roles:ngo-registry:start -->";
+    const END: &str = "<!-- roles:ngo-registry:end -->";
+
+    assert!(
+        entry_point_names(SOURCE, IMPL).count() > 0,
+        "found no entry points: has `{IMPL}` or its #[contractimpl] moved?"
+    );
+    assert!(
+        role_rows(ROLES, START, END).count() > 0,
+        "found no roles table between {START} and {END} in docs/ROLES.md"
+    );
+
+    for name in entry_point_names(SOURCE, IMPL) {
+        match role_rows(ROLES, START, END).find(|(row, _)| *row == name) {
+            None => panic!(
+                "`{name}` is a public NgoRegistry entry point with no row in docs/ROLES.md"
+            ),
+            Some((_, role)) => assert!(
+                !role.is_empty(),
+                "`{name}` has an empty role in docs/ROLES.md"
+            ),
+        }
+    }
+
+    for (name, _) in role_rows(ROLES, START, END) {
+        assert!(
+            entry_point_names(SOURCE, IMPL).any(|entry| entry == name),
+            "docs/ROLES.md lists `{name}`, which is not a public NgoRegistry entry point"
+        );
+        assert_eq!(
+            role_rows(ROLES, START, END)
+                .filter(|(row, _)| *row == name)
+                .count(),
+            1,
+            "`{name}` appears more than once in the ngo-registry roles table"
+        );
+    }
+}
