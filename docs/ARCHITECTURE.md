@@ -110,6 +110,51 @@ Soroban transactions directly against the contracts. It never touches a
 private key or the blockchain's raw RPC; signing is delegated to the
 wallet extension.
 
+## Supported tokens
+
+`donation-vault` is built for **Stellar Asset Contracts (SACs)**: the token
+contract that wraps a classic Stellar asset, including native XLM. Its
+accounting assumes one thing about the token: a `transfer` of `amount` moves
+exactly `amount`, and balances change only through transfers.
+
+The vault does not check this. `create_stream` accepts any token address
+except the vault's own (`Error::InvalidToken`). `allowed_tokens()` is only a
+list for frontend token pickers, and no entry point writes to it, so it
+always returns an empty list and nothing is enforced on-chain. Picking a token
+that behaves well is the job of the frontend and the operator.
+
+### Why the assumption matters
+
+Each stream records its own `balance`, and the vault records a per-token
+`committed_balance` (the sum of what it owes across all streams in that
+token). Neither is ever reconciled against the vault's real token balance.
+Payouts and refunds are paid from that real balance. If the real balance ends
+up lower than what was recorded, the vault has promised more than it holds,
+and the last streams to withdraw or cancel in that token fail.
+`surplus(token)` (real balance minus committed) shows a shortfall as `0`,
+because it saturates rather than going negative.
+
+### Token behaviors
+
+| Behavior | Supported | Why | What happens if it is used anyway |
+| --- | --- | --- | --- |
+| Exact transfers, balances change only on transfer (SAC, classic assets and XLM) | **Yes** | This is the model the accounting is built on. | Works as documented. |
+| Decimals other than 7 | **Yes** | The vault never reads `decimals()`. `deposit` and `rate` are raw smallest units. | Works, but every client-side conversion has to use the token's own decimals. All SACs have 7. See [Choosing a rate](./STREAM_LIFECYCLE.md#choosing-a-rate). |
+| A custom (non-SAC) SEP-41 token that behaves exactly like a SAC | **Not tested** | The vault only calls `transfer` and `balance`, but no custom token is tested or reviewed. | Probably works, at the operator's risk. Anything below that applies to the token applies here too. |
+| Fee on transfer (receiver gets less than `amount`) | **No** | `create_stream` and `top_up` credit the full `deposit`/`amount` to the stream and to `committed_balance`, but the vault receives less. On the way out, the NGO or donor receives less than the `withdraw`/`cancel` event reports. | The vault is short by the fee on every deposit. Payouts keep working until the real balance runs out, then the last `withdraw`, `withdraw_batch`, `cancel_stream`, or `rescue_stream` for that token reverts, possibly on a different donor's stream than the one that caused the shortfall. |
+| Rebasing (balances change without a transfer) | **No** | Stream balances are fixed numbers and never follow the rebase. | **Negative rebase:** same as fee on transfer, the last claimants in that token cannot be paid. **Positive rebase:** the extra shows up in `surplus(token)`. It is not credited to any stream, and the admin can move it to the treasury with `sweep_surplus`. |
+| Issuer can freeze balances (classic `AUTH_REQUIRED` / `AUTH_REVOCABLE`, or a token deny list) | **No** | A frozen address cannot send or receive, and the vault has no fallback path. | Nothing is lost, but funds stop moving until the issuer unfreezes. **Donor frozen:** `create_stream` and `top_up` fail, and `cancel_stream` reverts because its refund cannot be delivered. **NGO (or its payout address) frozen:** `withdraw` fails, and `cancel_stream` also reverts because it pays the NGO first, so the donor is stuck too (threat T-17). **Vault frozen:** every payout, refund, `rescue_stream`, and `sweep_surplus` in that token reverts for every stream. |
+| Issuer clawback (classic `AUTH_CLAWBACK_ENABLED`) | **No** | A clawback from the vault's balance lowers it without touching any stream. | Same as fee on transfer: the vault becomes short, and the last claimants in that token cannot be paid. |
+| A `transfer` that returns without moving funds, or that calls back into the vault | **No** | The vault treats a `transfer` that returns as done, and has no guard against a token calling back into it (threat T-15). | A silent no-op transfer lets a stream be created without any deposit, and its payouts then drain other streams' funds in the same token. A callback could act on accounting that is not yet updated. |
+
+An asset that only *has* the freeze or clawback flags set is not broken today,
+but the operator is trusting its issuer not to use them against the vault, a
+donor, or an NGO. Prefer assets without those flags, and check the issuer's
+flags before adding a token to the frontend.
+
+These limits are recorded as accepted risks in
+[THREAT_MODEL.md](./THREAT_MODEL.md) (T-15, T-16, T-17).
+
 ## Data flow: a donation, end to end
 
 1. Donor opens the frontend, connects Freighter (or another wallet), and

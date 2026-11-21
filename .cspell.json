@@ -13,6 +13,7 @@
     "cargo",
     "testnet",
     "mainnet",
+    "clawback"
     "machete"
   ],
   "ignoreRegExpList": ["```[\\s\\S]*?```", "`[^`\\n]+`"],
