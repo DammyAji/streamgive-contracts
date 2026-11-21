@@ -60,6 +60,34 @@ This project does not yet follow a formal versioning scheme — each contract's
   flag is kept so the entry can be renewed. A `renew` event carries the new
   expiry and a `verperiod` event the new period; renewing with no period
   configured fails with `Error::NoVerifyPeriod` (15) (#348).
+- `donation-vault`: optional minimum stream duration. `set_min_duration` (admin)
+  sets the shortest time to depletion, in seconds, that `create_stream` and
+  `modify_rate` accept; `min_duration` reads it back and it is included in
+  `get_config`. A deposit that would drain sooner is rejected with
+  `Error::StreamTooShort` (39), distinct from `InvalidAmount`. Emits a `mindur`
+  event. Off by default (`0`) (#340).
+- `donation-vault`: `withdraw_all(ngo, start, limit)` settles an NGO's streams
+  a bounded page at a time straight from the NGO's stream index, so a caller
+  never has to list stream ids off-chain or know when it has seen them all. It
+  returns a `WithdrawAllPage { amounts, next }` — the net payout per stream in
+  page order and the cursor to pass as `start` next time; iteration is complete
+  once `next` reaches the NGO's stream count. `limit` is clamped to
+  `MAX_BATCH_WITHDRAW_STREAMS`, and a page that has accrued nothing yields one
+  `0` per stream and still advances the cursor rather than failing (#342).
+- `donation-vault`: read-only `pending_refund(stream_id)` view for donors. It
+  returns the refund a `cancel_stream` would make right now — the stream's
+  remaining balance minus what has accrued to the NGO — applying the same rules
+  as `cancel_stream` (cliff and paused streams accrue nothing). A drained or
+  already-cancelled stream reports `0`. It is the donor's mirror of
+  `pending_payout` and never moves funds (#345).
+- `donation-vault`: the `drained` event. When settling a stream empties its
+  balance and flips its status to `Drained`, the vault emits
+  `DrainedEvent { stream_id, total_paid }` — the cumulative amount paid to the
+  NGO over the stream's life. Covers `withdraw`, `withdraw_batch` (once per
+  emptied stream), and the settle-driven `modify_rate`, `transfer_stream`, and
+  `pause_stream` paths. `cancel_stream` and `top_up` settle only to reclassify
+  a stream and stay silent, so an indexer sees the terminal transition once,
+  without recomputing it from `withdraw` events (#344).
 - Contract events for registry and vault state changes (see
   [`docs/EVENTS.md`](docs/EVENTS.md)).
 - Document storage TTL policy, inactivity expiry risks, and keep-alive entry

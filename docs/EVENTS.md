@@ -25,8 +25,8 @@ layout stable. Event type names include `RegisterEvent`, `RenamedEvent`,
 `UpgradedEvent`, `UpgradeProposedEvent`, `UpgradeCancelledEvent`,
 `UpgradeDelaySetEvent`, `ApproverAddedEvent`, `ApproverRemovedEvent`,
 `MetadataUriSetEvent`, `RenewedEvent`, `VerifyPeriodSetEvent`, `CreatedEvent`,
-`WithdrawnEvent`, `CancelledStreamEvent`, `RescuedStreamEvent`, `ToppedUpEvent`,
-`RateModifiedEvent`, and `SurplusSweptEvent`.
+`WithdrawnEvent`, `DrainedEvent`, `CancelledStreamEvent`, `RescuedStreamEvent`,
+`ToppedUpEvent`, `RateModifiedEvent`, and `SurplusSweptEvent`.
 
 `Address`, `i128`, `u64`, `u32`, `bool`, and `String` are the standard
 Soroban SDK/XDR types (`Address` is the SDK's account/contract address
@@ -379,6 +379,22 @@ Emitted by `clear_max_rate` when an admin removes the per-second rate ceiling.
 After this event, `create_stream` and `modify_rate` accept any positive rate
 again, the same as if `set_max_rate` had never been called.
 
+### `mindur`
+
+Emitted by `set_min_duration` when an admin changes the shortest stream
+lifetime — the shortest time to depletion — accepted by `create_stream` and
+`modify_rate`.
+
+| | |
+|---|---|
+| Topics | `("mindur",)` |
+| Data | `min_duration: u64` (the new minimum, in seconds; `0` disables the check) |
+
+A stream whose deposit would drain in fewer than this many seconds is rejected
+with `StreamTooShort`, a code distinct from `InvalidAmount`. Until an admin
+sets a value, the event never appears and the minimum is `0` (no floor), so the
+check is skipped entirely.
+
 ### `regset`
 
 Emitted by `set_registry` when an admin points the vault at an NGO registry
@@ -415,7 +431,8 @@ different address.
 | Topics | `("payoutset", ngo: Address)` |
 | Data | `payout: Address` (the new payout address) |
 
-`withdraw` and `withdraw_batch` pay the net amount to this address while the
+`withdraw`, `withdraw_batch`, and `withdraw_all` pay the net amount to this
+address while the
 NGO owner key continues to authorise those calls. Until an NGO sets one,
 `payout_address()` returns `None` and payouts go to the owner address itself.
 An indexer can track a given NGO's payout destination from these events without
@@ -507,7 +524,9 @@ short label only — never truncate or reinterpret it.
 ### `withdraw`
 
 Emitted by `withdraw` when an NGO claims everything accrued on a stream
-since the last checkpoint.
+since the last checkpoint. `withdraw_batch` and `withdraw_all` emit one of
+these per contributing stream, so an indexer handles single and paginated
+withdrawals identically.
 
 | | |
 |---|---|
@@ -523,6 +542,28 @@ address itself. The invariant `accrued = fee + net` holds for every payout.
 
 The `withdraw` entry point returns that same `net` amount, so callers displaying
 the payout receive the exact token units transferred to the NGO.
+
+### `drained`
+
+Emitted once when a stream's balance reaches zero and its status flips to
+`Drained`. It marks the stream as finished for an indexer, which otherwise has
+to recompute the transition from the `withdraw` events (#344).
+
+| | |
+|---|---|
+| Topics | `("drained", stream_id: u64)` |
+| Data | `(total_paid: i128)` |
+
+`total_paid` is the stream's cumulative `withdrawn` total at the moment it
+emptied — the lifetime amount paid to the NGO, not just the final
+withdrawal. It is emitted whenever the drain comes from settling a stream:
+`withdraw`, `withdraw_batch` (one per emptied stream), `modify_rate`,
+`transfer_stream`, and `pause_stream`. For a plain `withdraw` it follows that
+call's `withdraw` event; for the other entry points it is published while the
+stream is settled, so it precedes their own `ratemod` / `transfer` /
+`strmpause` event. `cancel_stream` and `top_up` never emit it — they settle a
+stream only to reclassify it (Cancelled, or reactivated Active), which is not
+a drain.
 
 ### `cancel`
 

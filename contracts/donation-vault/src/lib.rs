@@ -61,6 +61,18 @@ pub struct WithdrawnEvent {
     pub payout: Address,
 }
 
+/// Emitted once when a stream's balance reaches zero and its status becomes
+/// `Drained` (issue #344). Carries the stream id and the cumulative amount
+/// paid to the NGO over the stream's life, so an indexer can mark the stream
+/// finished without recomputing the transition from `withdraw` events.
+#[contractevent(topics = ["drained"], data_format = "vec")]
+pub struct DrainedEvent {
+    #[topic]
+    pub stream_id: u64,
+    /// The stream's `withdrawn` total at the moment it emptied.
+    pub total_paid: i128,
+}
+
 #[contractevent(topics = ["cancel"], data_format = "vec")]
 pub struct CancelledStreamEvent {
     #[topic]
@@ -145,6 +157,11 @@ pub struct MaxRateSetEvent {
 #[contractevent(topics = ["maxrtclr"], data_format = "single-value")]
 pub struct MaxRateClearedEvent {
     pub data: (),
+}
+
+#[contractevent(topics = ["mindur"], data_format = "single-value")]
+pub struct MinDurationSetEvent {
+    pub min_duration: u64,
 }
 
 #[contractevent(topics = ["rescue"], data_format = "single-value")]
@@ -327,6 +344,10 @@ pub struct Config {
     /// The highest per-second `rate` accepted by `create_stream` and
     /// `modify_rate`, when an admin has configured one. `None` means no cap.
     pub max_rate: Option<i128>,
+    /// The shortest time to depletion, in seconds, an admin will accept for a
+    /// new or re-rated stream. `0` means no minimum is enforced. See
+    /// `set_min_duration` and issue #340.
+    pub min_duration: u64,
     pub registry: Option<Address>,
     pub cancel_grace_ledgers: u32,
     pub total_donated: i128,
@@ -334,6 +355,20 @@ pub struct Config {
     pub total_fees_collected: i128,
     pub pending_admin: Option<Address>,
     pub renounced: bool,
+}
+
+/// A page of results from `withdraw_all` (issue #342): the net payout for each
+/// stream in the page plus the cursor for the next page.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawAllPage {
+    /// Net payout per stream in the page, in NGO-index order. A stream that
+    /// had nothing to withdraw contributes `0`.
+    pub amounts: Vec<i128>,
+    /// The `start` to pass on the next call: one past the end of this page,
+    /// clamped to the NGO's stream count. Iteration is complete once it
+    /// reaches that count (see `streams_by_ngo`).
+    pub next: u32,
 }
 
 #[contracttype]
@@ -404,6 +439,10 @@ pub enum DataKey {
     /// of stream balances for that token). Used by `sweep_surplus` to bound a
     /// sweep to the surplus above it. Absent means zero. See issue #346.
     CommittedBalance(Address),
+    /// Shortest time to depletion, in seconds, that `create_stream` and
+    /// `modify_rate` accept. Absent (or zero) means no minimum. See
+    /// `set_min_duration` and issue #340.
+    MinDuration,
 }
 
 #[contracterror]
@@ -511,6 +550,11 @@ pub enum Error {
     /// `sweep_surplus` was asked to move more than the surplus above the
     /// token's committed balance, which would dip into stream funds.
     SweepExceedsSurplus = 38,
+    /// A stream's deposit would deplete in fewer seconds than the
+    /// admin-configured `min_duration`. Raised by `create_stream` and
+    /// `modify_rate` before any funds move. Distinct from `InvalidAmount`,
+    /// which only covers a zero or negative amount. See issue #340.
+    StreamTooShort = 39,
     // Error numbers are append-only: never renumber, reuse, or remove a
     // variant. New errors take the next unused number. See
     // docs/UPGRADE_POLICY.md.
@@ -801,6 +845,32 @@ fn max_rate_cap(env: &Env) -> Option<i128> {
     env.storage().instance().get(&DataKey::MaxRate)
 }
 
+/// Returns the admin-configured minimum time to depletion, in seconds. `0`
+/// (the default) means no minimum is enforced, so the check in
+/// `create_stream` and `modify_rate` is skipped entirely. See issue #340.
+fn min_duration_seconds(env: &Env) -> u64 {
+    env.storage().instance().get(&DataKey::MinDuration).unwrap_or(0)
+}
+
+/// Returns true when a stream holding `balance` at a per-second `rate` would
+/// deplete in fewer than `min_duration` seconds. A `min_duration` of `0`
+/// disables the check.
+///
+/// The lifespan is measured with ceiling division so a stream that lasts a
+/// full final partial second is not misjudged: a 100-unit balance at 30 per
+/// second lasts 4 seconds, not 3. `ceil(balance / rate) < min_duration` is
+/// rewritten as `balance <= (min_duration - 1) * rate`, which avoids the
+/// division and reports the (unreachable) overflow case as "too short".
+fn depletes_before_min_duration(balance: i128, rate: i128, min_duration: u64) -> bool {
+    if min_duration == 0 {
+        return false;
+    }
+    match ((min_duration - 1) as i128).checked_mul(rate) {
+        Some(threshold) => balance <= threshold,
+        None => true,
+    }
+}
+
 fn record_outflow_totals(env: &Env, gross: i128, fee: i128) -> Result<(), Error> {
     if gross > 0 {
         let withdrawn: i128 = env
@@ -844,7 +914,13 @@ fn accrual_base(stream: &Stream) -> u64 {
 /// This is shared by every operation that changes a stream's balance or rate
 /// so payout accounting, checked arithmetic, and the checkpoint timestamp
 /// cannot drift between entry points.
-fn settle(env: &Env, stream: &mut Stream, now: u64) -> Result<i128, Error> {
+///
+/// It marks an emptied Active stream `Drained` but does **not** emit the
+/// `drained` event itself: `cancel_stream` and `top_up` reuse this to settle a
+/// stream they are about to reclassify (Cancelled / Active), so the "ran to
+/// completion" event would be spurious for them. Every other caller goes
+/// through the [`settle`] wrapper, which announces the transition (issue #344).
+fn settle_core(env: &Env, stream: &mut Stream, now: u64) -> Result<i128, Error> {
     let accrued = if stream.status == StreamStatus::Paused {
         0
     } else {
@@ -875,6 +951,22 @@ fn settle(env: &Env, stream: &mut Stream, now: u64) -> Result<i128, Error> {
         pay_ngo(env, &token_client, &stream.ngo, accrued);
     }
 
+    Ok(accrued)
+}
+
+/// Settles a stream and, if that emptied it, publishes the `drained` event
+/// (issue #344). Wraps [`settle_core`] so every settle-driven drain announces
+/// the transition exactly once, from the same place the status flips.
+fn settle(env: &Env, stream_id: u64, stream: &mut Stream, now: u64) -> Result<i128, Error> {
+    let was_active = stream.status == StreamStatus::Active;
+    let accrued = settle_core(env, stream, now)?;
+    if was_active && stream.status == StreamStatus::Drained {
+        DrainedEvent {
+            stream_id,
+            total_paid: stream.withdrawn,
+        }
+        .publish(env);
+    }
     Ok(accrued)
 }
 
@@ -949,6 +1041,14 @@ fn create_stream_inner(
         if rate > max_rate {
             return Err(Error::RateTooHigh);
         }
+    }
+
+    // Optional minimum lifespan (issue #340): a deposit that would drain in
+    // fewer than `min_duration` seconds is almost always a mistyped rate, so
+    // it is rejected before any funds move. Distinct from `DepositTooLow`
+    // (deposit size alone) and `InvalidAmount` (zero/negative).
+    if depletes_before_min_duration(deposit, rate, min_duration_seconds(&env)) {
+        return Err(Error::StreamTooShort);
     }
 
     // Per-donor stream cap (issue #94). Read before the token transfer
@@ -1646,6 +1746,69 @@ impl DonationVault {
         Ok((gross - fee, fee))
     }
 
+    /// Read-only view of the amount a `cancel_stream` would refund the donor
+    /// right now: the stream's remaining `balance` minus what has accrued to
+    /// the NGO (issue #345).
+    ///
+    /// `pending_payout` shows what the NGO would receive; this is the donor's
+    /// mirror image, so a UI can show the refund a cancel would return before
+    /// the donor commits to it. It applies the same rules as `cancel_stream`,
+    /// which settles via the shared `settle` path: nothing accrues before a
+    /// stream's `start` (cliff), and a stream paused by its donor accrues
+    /// nothing, so its whole balance is refundable. Accrual is capped at the
+    /// balance, so the result is never negative.
+    ///
+    /// A drained stream (`balance` 0) and an already-cancelled stream (balance
+    /// and rate zeroed) both report `0`, consistent with `pending_payout` and
+    /// `depletion_time`, which likewise read a cancelled stream's zeroed state
+    /// rather than failing.
+    ///
+    /// Never mutates storage or moves funds.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::{Address as _, Ledger}, token, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// # let token_admin = Address::generate(&env);
+    /// # let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
+    /// # let token_client = token::StellarAssetClient::new(&env, &sac.address());
+    /// # let donor = Address::generate(&env);
+    /// # let ngo = Address::generate(&env);
+    /// # token_client.mint(&donor, &1_000);
+    /// let stream_id = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
+    /// env.ledger().with_mut(|l| l.timestamp += 20); // 200 accrues
+    ///
+    /// // A cancel right now would refund the untouched 800 to the donor.
+    /// assert_eq!(client.pending_refund(&stream_id), 800);
+    /// ```
+    pub fn pending_refund(env: Env, stream_id: u64) -> Result<i128, Error> {
+        let stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stream(stream_id))
+            .ok_or(Error::StreamNotFound)?;
+
+        // Mirror `settle`'s accrual rules so this matches what `cancel_stream`
+        // would actually refund: a paused stream accrues nothing, and a
+        // non-positive rate or a stream before its cliff accrues nothing.
+        let accrued = if stream.status == StreamStatus::Paused {
+            0
+        } else {
+            let now = env.ledger().timestamp();
+            let elapsed = now.saturating_sub(accrual_base(&stream));
+            math::accrued(stream.rate, elapsed, stream.balance)
+        };
+
+        Ok(stream.balance - accrued)
+    }
+
     /// Bumps a stream's persistent-storage TTL without touching its state.
     ///
     /// # Examples
@@ -1767,7 +1930,7 @@ impl DonationVault {
 
     /// Reads back all admin-set configuration and contract state parameters in one call:
     /// `paused`, `treasury`, `fee_bps`, `min_deposit`, `max_streams_per_donor`,
-    /// `max_rate`, `registry`, `cancel_grace_ledgers`, `total_donated`,
+    /// `max_rate`, `min_duration`, `registry`, `cancel_grace_ledgers`, `total_donated`,
     /// `total_withdrawn`, `total_fees_collected`, `pending_admin`, and `renounced`.
     pub fn get_config(env: Env) -> Config {
         Config {
@@ -1789,6 +1952,7 @@ impl DonationVault {
                 .get(&DataKey::MaxStreamsPerDonor)
                 .unwrap_or(DEFAULT_MAX_STREAMS_PER_DONOR),
             max_rate: max_rate_cap(&env),
+            min_duration: min_duration_seconds(&env),
             registry: env.storage().instance().get(&DataKey::Registry),
             cancel_grace_ledgers: env
                 .storage()
@@ -2302,6 +2466,49 @@ impl DonationVault {
         max_rate_cap(&env)
     }
 
+    /// Sets the shortest allowed time to depletion, in seconds. Admin-gated.
+    /// `create_stream` and `modify_rate` reject a stream whose deposit would
+    /// drain in fewer than this many seconds with `Error::StreamTooShort`.
+    ///
+    /// This is off by default (`0`): until an admin sets it, a deposit can be
+    /// configured to drain in a single second, which is rarely intended and
+    /// wastes fees for everyone. Setting a floor catches a mistyped rate at
+    /// the contract edge instead of after the deposit is gone. Passing `0`
+    /// disables the check.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// client.set_min_duration(&60);
+    /// assert_eq!(client.min_duration(), 60);
+    /// ```
+    pub fn set_min_duration(env: Env, min_duration: u64) -> Result<(), Error> {
+        require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::MinDuration, &min_duration);
+        extend_instance_ttl(&env);
+
+        MinDurationSetEvent { min_duration }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Reads back the configured minimum stream duration in seconds. `0`
+    /// until an admin sets one, meaning no minimum is enforced. See
+    /// `set_min_duration`.
+    pub fn min_duration(env: Env) -> u64 {
+        min_duration_seconds(&env)
+    }
+
     /// Sets the NGO registry contract used to verify NGOs before a stream
     /// is opened. Admin-gated.
     ///
@@ -2632,7 +2839,7 @@ impl DonationVault {
         }
 
         let now = env.ledger().timestamp();
-        let settled = settle(&env, &mut stream, now)?;
+        let settled = settle(&env, stream_id, &mut stream, now)?;
         if stream.balance == 0 {
             stream.status = StreamStatus::Drained;
         } else {
@@ -2736,7 +2943,8 @@ impl DonationVault {
 
         record_payout(&mut stream, accrued)?;
         stream.last_update = now;
-        if stream.balance == 0 {
+        let drained = stream.balance == 0;
+        if drained {
             stream.status = StreamStatus::Drained;
         }
         env.storage().persistent().set(&key, &stream);
@@ -2760,6 +2968,16 @@ impl DonationVault {
             payout,
         }
         .publish(&env);
+
+        // Announce the terminal transition after the payout and `withdraw`
+        // event, so an indexer observes them in order (issue #344).
+        if drained {
+            DrainedEvent {
+                stream_id,
+                total_paid: stream.withdrawn,
+            }
+            .publish(&env);
+        }
 
         Ok(net)
     }
@@ -2838,6 +3056,10 @@ impl DonationVault {
         let mut net_payouts: Map<Address, i128> = Map::new(&env);
         let mut fee_payouts: Map<Address, i128> = Map::new(&env);
         let mut gross_payouts: Map<Address, i128> = Map::new(&env);
+        // Streams this batch empties, mapped to the water mark of their
+        // cumulative payout, so the `drained` event can be published after the
+        // transfers alongside each `withdraw` (issue #344).
+        let mut drained_totals: Map<u64, i128> = Map::new(&env);
         let mut total_accrued: i128 = 0;
 
         for stream_id in stream_ids.iter() {
@@ -2889,6 +3111,7 @@ impl DonationVault {
             stream.last_update = now;
             if stream.balance == 0 {
                 stream.status = StreamStatus::Drained;
+                drained_totals.set(stream_id, stream.withdrawn);
             }
             env.storage().persistent().set(&key, &stream);
             extend_stream_ttl(&env, stream_id);
@@ -2993,10 +3216,117 @@ impl DonationVault {
                     payout: payout.clone(),
                 }
                 .publish(&env);
+
+                // Follow the `withdraw` for any stream this batch emptied,
+                // matching `withdraw`'s withdraw-then-drained order (#344).
+                if let Some(total_paid) = drained_totals.get(stream_id) {
+                    DrainedEvent {
+                        stream_id,
+                        total_paid,
+                    }
+                    .publish(&env);
+                }
             }
         }
 
         Ok(net_amounts)
+    }
+
+    /// Withdraws from every stream an NGO owns, a bounded page at a time, using
+    /// the NGO's stream index so the caller never has to list stream ids
+    /// off-chain (issue #342).
+    ///
+    /// `start` and `limit` select the page: streams are taken from the NGO's
+    /// index in creation order from position `start`, up to `limit` of them.
+    /// `limit` is clamped to `MAX_BATCH_WITHDRAW_STREAMS`, matching
+    /// `withdraw_batch`'s footprint budget. Each stream is settled exactly as
+    /// `withdraw` would, and the page is returned with the cursor to pass as
+    /// `start` next time; iteration is complete when `next` reaches the NGO's
+    /// stream count (`streams_by_ngo(ngo, 0, ..).len()`).
+    ///
+    /// The NGO authorizes the call once. A page whose streams have all accrued
+    /// nothing is not an error: it returns one `0` per stream in the page, so
+    /// the caller can simply advance the cursor and keep paging.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::{Address as _, Ledger}, token, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// # let token_admin = Address::generate(&env);
+    /// # let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
+    /// # let token_client = token::StellarAssetClient::new(&env, &sac.address());
+    /// # let donor = Address::generate(&env);
+    /// # let ngo = Address::generate(&env);
+    /// # token_client.mint(&donor, &3_000);
+    /// let _a = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
+    /// let _b = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
+    /// env.ledger().with_mut(|l| l.timestamp += 50);
+    ///
+    /// // Collect from this NGO's first (and only) page of streams.
+    /// let page = client.withdraw_all(&ngo, &0, &20);
+    /// assert_eq!(page.amounts.len(), 2);
+    /// assert_eq!(page.next, 2);
+    /// ```
+    pub fn withdraw_all(
+        env: Env,
+        ngo: Address,
+        start: u32,
+        limit: u32,
+    ) -> Result<WithdrawAllPage, Error> {
+        require_not_paused(&env)?;
+
+        let index: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NgoStreams(ngo))
+            .unwrap_or_else(|| Vec::new(&env));
+        let total = index.len();
+
+        if limit == 0 || start >= total {
+            return Ok(WithdrawAllPage {
+                amounts: Vec::new(&env),
+                next: total,
+            });
+        }
+
+        let effective_limit = limit.min(MAX_BATCH_WITHDRAW_STREAMS);
+        let end = start
+            .checked_add(effective_limit)
+            .unwrap_or(total)
+            .min(total);
+
+        let mut page = Vec::new(&env);
+        for position in start..end {
+            if let Some(stream_id) = index.get(position) {
+                page.push_back(stream_id);
+            }
+        }
+
+        // Settle the page exactly like `withdraw_batch` (one transfer per
+        // token plus a `withdraw` event per stream). A page that accrues
+        // nothing is normal mid-pagination, so it yields zero entries rather
+        // than an error, letting the caller advance the cursor.
+        let page_len = page.len();
+        let amounts = match Self::withdraw_batch(env.clone(), page) {
+            Ok(amounts) => amounts,
+            Err(Error::NothingToWithdraw) => {
+                let mut zeros = Vec::new(&env);
+                for _ in 0..page_len {
+                    zeros.push_back(0i128);
+                }
+                zeros
+            }
+            Err(error) => return Err(error),
+        };
+
+        Ok(WithdrawAllPage { amounts, next: end })
     }
 
     /// Stops a stream for good: settles whatever has already accrued to the
@@ -3047,7 +3377,7 @@ impl DonationVault {
         }
 
         let now = env.ledger().timestamp();
-        let accrued = settle(&env, &mut stream, now)?;
+        let accrued = settle_core(&env, &mut stream, now)?;
 
         let refund = stream.balance;
 
@@ -3256,7 +3586,7 @@ impl DonationVault {
         let token_client = token::Client::new(&env, &stream.token);
 
         let now = env.ledger().timestamp();
-        let settled = settle(&env, &mut stream, now)?;
+        let settled = settle_core(&env, &mut stream, now)?;
 
         // Update state before the external token transfer
         stream.balance = stream
@@ -3378,8 +3708,16 @@ impl DonationVault {
             require_verified_ngo(&env, &stream.ngo)?;
         }
 
+        // Optional minimum lifespan (issue #340): the stream must still last
+        // at least `min_duration` seconds at the new rate. Checked against the
+        // remaining balance before settling, so a rejection leaves the stream
+        // — and its funds — exactly as they were.
+        if depletes_before_min_duration(stream.balance, new_rate, min_duration_seconds(&env)) {
+            return Err(Error::StreamTooShort);
+        }
+
         let now = env.ledger().timestamp();
-        let settled = settle(&env, &mut stream, now)?;
+        let settled = settle(&env, stream_id, &mut stream, now)?;
         stream.rate = new_rate;
 
         env.storage().persistent().set(&key, &stream);
@@ -3429,7 +3767,7 @@ impl DonationVault {
 
         let old_ngo = stream.ngo.clone();
         let now = env.ledger().timestamp();
-        let settled = settle(&env, &mut stream, now)?;
+        let settled = settle(&env, stream_id, &mut stream, now)?;
         if stream.balance == 0 {
             stream.status = StreamStatus::Drained;
         }
