@@ -82,9 +82,23 @@ This project does not yet follow a formal versioning scheme — each contract's
   is measured from `start`, and cancelling before `start` refunds the whole
   deposit. A `start` more than `MAX_START_DELAY_SECONDS` (one year) ahead is
   rejected with `Error::StartTooFar` (#337).
+- `ngo-registry`: admin-managed approver list so review work can be delegated
+  without sharing the admin key. `add_approver` / `remove_approver` (admin-gated)
+  manage the list, `is_approver` / `list_approvers` expose it, and `approve_ngo`,
+  `batch_approve`, and `revoke_ngo` now accept the admin or any listed approver as
+  the acting address (`Error::NotApprover` otherwise). Adds `Error::NotApprover`
+  (12) and `Error::AlreadyApprover` (13), emits `apadd` / `aprem`, and backs the
+  new `DataKey::Approvers` instance key (#349).
 
 ### Changed
 
+- **BREAKING** `ngo-registry`: `approve_ngo`, `batch_approve`, and `revoke_ngo`
+  now take the acting address as a leading argument
+  (`approve_ngo(approver: Address, ngo_owner: Address)`,
+  `batch_approve(approver: Address, owners: Vec<Address>)`,
+  `revoke_ngo(approver: Address, ngo_owner: Address)`) and require the caller to
+  be the admin or a listed approver. Integrators calling these entry points must
+  pass the authorising address and update their invocation arguments (#349).
 - **BREAKING** `donation-vault`: the `withdraw` event data payload now includes
   the payout destination, changing from `(accrued: i128, fee: i128, net: i128)`
   to `(accrued: i128, fee: i128, net: i128, payout: Address)`. Off-chain

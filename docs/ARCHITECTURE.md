@@ -47,8 +47,11 @@ verifies NGOs against `ngo-registry` on `create_stream`, `top_up`, and
 `transfer_stream` (failing closed if the lookup fails or the NGO is not
 verified); until `set_registry` is called — or after `clear_registry` — no
 registry check is performed. Applications (`register`, `update_name`,
-`unregister`) are owner-gated, verification and moderation (`approve_ngo`,
-`batch_approve`, `revoke_ngo`, `remove_ngo`) are admin-gated, and reads and
+`unregister`) are owner-gated; verification and moderation (`approve_ngo`,
+`batch_approve`, `revoke_ngo`, `remove_ngo`) are privileged — the three review
+entry points accept the admin or any address on the admin-managed approver list
+(`add_approver` / `remove_approver`), while `remove_ngo` stays admin-only, so
+review work can be delegated without sharing the admin key; reads and
 `touch_ngo` are public.
 
 ### `donation-vault` (Soroban contract)

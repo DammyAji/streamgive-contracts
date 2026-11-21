@@ -72,6 +72,20 @@ pub struct UpgradedEvent {
     pub new_wasm_hash: BytesN<32>,
 }
 
+#[contractevent(topics = ["apadd"], data_format = "single-value")]
+pub struct ApproverAddedEvent {
+    #[topic]
+    pub approver: Address,
+    pub data: (),
+}
+
+#[contractevent(topics = ["aprem"], data_format = "single-value")]
+pub struct ApproverRemovedEvent {
+    #[topic]
+    pub approver: Address,
+    pub data: (),
+}
+
 #[contracttype]
 // Debug and PartialEq let tests assert_eq! on a try_* call’s full
 // Result<Result<Ngo, _>, _> rather than unwrapping it by hand first.
@@ -102,6 +116,8 @@ pub enum DataKey {
     OwnerByIndex(u32),
     /// Index of a registered NGO owner in the owners index.
     IndexByOwner(Address),
+    /// Addresses (other than the admin) permitted to approve and revoke NGOs.
+    Approvers,
 }
 
 #[contracterror]
@@ -128,6 +144,11 @@ pub enum Error {
     /// The supplied name is empty, contains only Unicode whitespace or invisible
     /// format characters, contains control characters, or is invalid UTF-8.
     InvalidName = 11,
+    /// `approve_ngo`, `batch_approve`, or `revoke_ngo` was called by an address
+    /// that is neither the admin nor a listed approver.
+    NotApprover = 12,
+    /// `add_approver` was called for an address already in the approver list.
+    AlreadyApprover = 13,
     // Error numbers are append-only: never renumber, reuse, or remove a
     // variant. New errors take the next unused number. See
     // docs/UPGRADE_POLICY.md.
@@ -278,6 +299,39 @@ fn require_admin(env: &Env) -> Result<Address, Error> {
         .ok_or(Error::NotInitialized)?;
     admin.require_auth();
     Ok(admin)
+}
+
+/// Reads the stored approver list, or an empty list if none was set.
+fn read_approvers(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::Approvers)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Returns whether `candidate` is in the approver list. The admin is not
+/// stored here, so this reflects explicit approvers only.
+fn is_approver_address(env: &Env, candidate: &Address) -> bool {
+    read_approvers(env).contains(candidate)
+}
+
+/// Authorizes a review action (approve/revoke). The acting address must be
+/// either the admin or a listed approver, and must have authorized the call.
+/// Because a contract can't observe its own caller, the acting address is
+/// passed in by the caller and checked here: this is what lets review work be
+/// delegated without handing out the admin key. Fails with
+/// `Error::NotApprover` for anyone else.
+fn require_approver(env: &Env, candidate: &Address) -> Result<(), Error> {
+    let admin: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(Error::NotInitialized)?;
+    if *candidate != admin && !is_approver_address(env, candidate) {
+        return Err(Error::NotApprover);
+    }
+    candidate.require_auth();
+    Ok(())
 }
 
 /// Marks one registered, unverified NGO as verified and publishes its
@@ -723,6 +777,149 @@ impl NgoRegistry {
         Ok(())
     }
 
+    /// Adds an address to the approver list. Admin-only.
+    ///
+    /// Approvers may call `approve_ngo`, `batch_approve`, and `revoke_ngo`
+    /// without holding the admin key, which is how review work is delegated
+    /// without granting control over upgrades or admin transfer. The admin is
+    /// always able to review whether or not it appears in this list, so adding
+    /// the admin is allowed but unnecessary. Fails with
+    /// `Error::AlreadyApprover` if the address is already listed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryArgs, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let admin = Address::generate(&env);
+    /// # let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// let reviewer = Address::generate(&env);
+    /// client.add_approver(&reviewer);
+    /// assert!(client.is_approver(&reviewer));
+    /// ```
+    pub fn add_approver(env: Env, approver: Address) -> Result<(), Error> {
+        require_admin(&env)?;
+
+        let mut approvers = read_approvers(&env);
+        if approvers.contains(&approver) {
+            return Err(Error::AlreadyApprover);
+        }
+        approvers.push_back(approver.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::Approvers, &approvers);
+        extend_instance_ttl(&env);
+
+        ApproverAddedEvent {
+            approver,
+            data: (),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Removes an address from the approver list. Admin-only.
+    ///
+    /// The address can no longer approve or revoke NGOs; any NGO it approved
+    /// stays approved. Fails with `Error::NotApprover` if the address is not
+    /// currently listed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryArgs, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let admin = Address::generate(&env);
+    /// # let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// let reviewer = Address::generate(&env);
+    /// client.add_approver(&reviewer);
+    /// client.remove_approver(&reviewer);
+    /// assert!(!client.is_approver(&reviewer));
+    /// ```
+    pub fn remove_approver(env: Env, approver: Address) -> Result<(), Error> {
+        require_admin(&env)?;
+
+        let approvers = read_approvers(&env);
+        let mut remaining = Vec::new(&env);
+        let mut found = false;
+        for listed in approvers.iter() {
+            if listed == approver {
+                found = true;
+            } else {
+                remaining.push_back(listed);
+            }
+        }
+        if !found {
+            return Err(Error::NotApprover);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Approvers, &remaining);
+        extend_instance_ttl(&env);
+
+        ApproverRemovedEvent {
+            approver,
+            data: (),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns whether an address is in the approver list.
+    ///
+    /// Reflects explicit approvers only: the admin can always approve and
+    /// revoke NGOs, so this returns `false` for the admin unless it was also
+    /// added with `add_approver`. Never errors or panics.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryArgs, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let admin = Address::generate(&env);
+    /// # let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// let reviewer = Address::generate(&env);
+    /// assert!(!client.is_approver(&reviewer));
+    /// client.add_approver(&reviewer);
+    /// assert!(client.is_approver(&reviewer));
+    /// ```
+    pub fn is_approver(env: Env, addr: Address) -> bool {
+        is_approver_address(&env, &addr)
+    }
+
+    /// Returns every address in the approver list, in the order they were
+    /// added. Returns an empty list when none are configured. Never errors or
+    /// panics.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryArgs, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let admin = Address::generate(&env);
+    /// # let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// let reviewer = Address::generate(&env);
+    /// client.add_approver(&reviewer);
+    /// assert_eq!(client.list_approvers().len(), 1);
+    /// ```
+    pub fn list_approvers(env: Env) -> Vec<Address> {
+        read_approvers(&env)
+    }
+
     /// Returns a paginated list of registered NGO owner addresses.
     ///
     /// # Pagination Semantics
@@ -875,7 +1072,7 @@ impl NgoRegistry {
     /// let name = String::from_str(&env, "Example NGO");
     /// client.register(&owner, &name);
     /// assert!(!client.is_verified(&owner));
-    /// client.approve_ngo(&owner);
+    /// client.approve_ngo(&admin, &owner);
     /// assert!(client.is_verified(&owner));
     /// ```
     pub fn is_verified(env: Env, owner: Address) -> bool {
@@ -914,10 +1111,13 @@ impl NgoRegistry {
             .unwrap_or(0)
     }
 
-    /// Marks a registered NGO as verified. Admin-only. Fails with
+    /// Marks a registered NGO as verified. Callable by the admin or a listed
+    /// approver; `approver` names the acting address and must have authorized
+    /// the call (see `add_approver`). Fails with
     /// `Error::AlreadyVerified` if the NGO is already verified, so a
     /// repeated call can't rewrite the entry or publish a duplicate
-    /// `approved` event.
+    /// `approved` event, and `Error::NotApprover` if `approver` is neither the
+    /// admin nor a listed approver.
     ///
     /// # Examples
     ///
@@ -933,15 +1133,17 @@ impl NgoRegistry {
     /// # let owner = Address::generate(&env);
     /// # let name = String::from_str(&env, "Example NGO");
     /// # client.register(&owner, &name);
-    /// client.approve_ngo(&owner);
+    /// client.approve_ngo(&admin, &owner);
     /// assert!(client.get_ngo(&owner).verified);
     /// ```
-    pub fn approve_ngo(env: Env, ngo_owner: Address) -> Result<(), Error> {
-        require_admin(&env)?;
+    pub fn approve_ngo(env: Env, approver: Address, ngo_owner: Address) -> Result<(), Error> {
+        require_approver(&env, &approver)?;
         approve_registered_ngo(&env, ngo_owner)
     }
 
-    /// Marks several registered NGOs as verified in a single call. Admin-only.
+    /// Marks several registered NGOs as verified in a single call. Callable by
+    /// the admin or a listed approver; `approver` names the acting address and
+    /// must have authorized the call.
     ///
     /// Approves each owner in order, publishing one `approved` event per NGO
     /// exactly as `approve_ngo` would. The call is atomic: if any owner has no
@@ -965,10 +1167,14 @@ impl NgoRegistry {
     /// client.register(&a, &String::from_str(&env, "Red Cross"));
     /// client.register(&b, &String::from_str(&env, "Oxfam"));
     ///
-    /// client.batch_approve(&vec![&env, a, b]);
+    /// client.batch_approve(&admin, &vec![&env, a, b]);
     /// ```
-    pub fn batch_approve(env: Env, owners: Vec<Address>) -> Result<(), Error> {
-        require_admin(&env)?;
+    pub fn batch_approve(
+        env: Env,
+        approver: Address,
+        owners: Vec<Address>,
+    ) -> Result<(), Error> {
+        require_approver(&env, &approver)?;
         for ngo_owner in owners.iter() {
             approve_registered_ngo(&env, ngo_owner)?;
         }
@@ -976,10 +1182,13 @@ impl NgoRegistry {
     }
 
     /// Reverses a prior approval, marking a registered NGO as unverified
-    /// again. Admin-only. Returns `Error::NotRegistered` for an address
-    /// with no entry, matching `approve_ngo`'s existing behavior, and
-    /// `Error::NotVerified` if the NGO isn't currently verified, so a
-    /// repeated call can't publish a duplicate `revoked` event.
+    /// again. Callable by the admin or a listed approver; `approver` names the
+    /// acting address and must have authorized the call. Returns
+    /// `Error::NotRegistered` for an address with no entry, matching
+    /// `approve_ngo`'s existing behavior, `Error::NotVerified` if the NGO
+    /// isn't currently verified, so a repeated call can't publish a duplicate
+    /// `revoked` event, and `Error::NotApprover` if `approver` is neither the
+    /// admin nor a listed approver.
     ///
     /// # Examples
     ///
@@ -995,12 +1204,12 @@ impl NgoRegistry {
     /// # let owner = Address::generate(&env);
     /// # let name = String::from_str(&env, "Example NGO");
     /// # client.register(&owner, &name);
-    /// # client.approve_ngo(&owner);
-    /// client.revoke_ngo(&owner);
+    /// # client.approve_ngo(&admin, &owner);
+    /// client.revoke_ngo(&admin, &owner);
     /// assert!(!client.get_ngo(&owner).verified);
     /// ```
-    pub fn revoke_ngo(env: Env, ngo_owner: Address) -> Result<(), Error> {
-        require_admin(&env)?;
+    pub fn revoke_ngo(env: Env, approver: Address, ngo_owner: Address) -> Result<(), Error> {
+        require_approver(&env, &approver)?;
 
         let key = DataKey::Ngo(ngo_owner.clone());
         let mut ngo: Ngo = env

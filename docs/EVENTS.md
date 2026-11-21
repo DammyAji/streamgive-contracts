@@ -22,7 +22,7 @@ layout stable. Event type names include `RegisterEvent`, `RenamedEvent`,
 `MinDepositSetEvent`, `CancelGraceLedgersSetEvent`, `RegistrySetEvent`,
 `PayoutAddressSetEvent`, `MaxStreamsPerDonorSetEvent`, `MaxRateSetEvent`,
 `MaxRateClearedEvent`, `InitializedEvent`,
-`UpgradedEvent`,
+`UpgradedEvent`, `ApproverAddedEvent`, `ApproverRemovedEvent`,
 `CreatedEvent`, `WithdrawnEvent`, `CancelledStreamEvent`, `RescuedStreamEvent`,
 `ToppedUpEvent`, and `RateModifiedEvent`.
 
@@ -110,6 +110,34 @@ Emitted by `upgrade` when an admin replaces the registry's Wasm bytecode.
 |---|---|
 | Topics | `("upgrade",)` |
 | Data | `new_wasm_hash: BytesN<32>` |
+
+### `apadd`
+
+Emitted by `add_approver` when the admin adds an address to the approver list,
+granting it the right to call `approve_ngo`, `batch_approve`, and `revoke_ngo`.
+
+| | |
+|---|---|
+| Topics | `("apadd", approver: Address)` |
+| Data | `()` (no payload) |
+
+An indexer can maintain the current approver set from `apadd`/`aprem` events
+without polling `list_approvers`. The admin is always able to approve and
+revoke and does not need to be — and is never added to — the list, so no
+`apadd` event is emitted for it.
+
+### `aprem`
+
+Emitted by `remove_approver` when the admin removes an address from the
+approver list, revoking that right.
+
+| | |
+|---|---|
+| Topics | `("aprem", approver: Address)` |
+| Data | `()` (no payload) |
+
+Removing an address that is not on the list fails with `NotApprover` and
+emits nothing.
 
 ## `donation-vault`
 
