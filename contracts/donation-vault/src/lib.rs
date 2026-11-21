@@ -1712,6 +1712,69 @@ impl DonationVault {
         Ok((gross - fee, fee))
     }
 
+    /// Read-only view of the amount a `cancel_stream` would refund the donor
+    /// right now: the stream's remaining `balance` minus what has accrued to
+    /// the NGO (issue #345).
+    ///
+    /// `pending_payout` shows what the NGO would receive; this is the donor's
+    /// mirror image, so a UI can show the refund a cancel would return before
+    /// the donor commits to it. It applies the same rules as `cancel_stream`,
+    /// which settles via the shared `settle` path: nothing accrues before a
+    /// stream's `start` (cliff), and a stream paused by its donor accrues
+    /// nothing, so its whole balance is refundable. Accrual is capped at the
+    /// balance, so the result is never negative.
+    ///
+    /// A drained stream (`balance` 0) and an already-cancelled stream (balance
+    /// and rate zeroed) both report `0`, consistent with `pending_payout` and
+    /// `depletion_time`, which likewise read a cancelled stream's zeroed state
+    /// rather than failing.
+    ///
+    /// Never mutates storage or moves funds.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::{Address as _, Ledger}, token, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// # let token_admin = Address::generate(&env);
+    /// # let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
+    /// # let token_client = token::StellarAssetClient::new(&env, &sac.address());
+    /// # let donor = Address::generate(&env);
+    /// # let ngo = Address::generate(&env);
+    /// # token_client.mint(&donor, &1_000);
+    /// let stream_id = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
+    /// env.ledger().with_mut(|l| l.timestamp += 20); // 200 accrues
+    ///
+    /// // A cancel right now would refund the untouched 800 to the donor.
+    /// assert_eq!(client.pending_refund(&stream_id), 800);
+    /// ```
+    pub fn pending_refund(env: Env, stream_id: u64) -> Result<i128, Error> {
+        let stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stream(stream_id))
+            .ok_or(Error::StreamNotFound)?;
+
+        // Mirror `settle`'s accrual rules so this matches what `cancel_stream`
+        // would actually refund: a paused stream accrues nothing, and a
+        // non-positive rate or a stream before its cliff accrues nothing.
+        let accrued = if stream.status == StreamStatus::Paused {
+            0
+        } else {
+            let now = env.ledger().timestamp();
+            let elapsed = now.saturating_sub(accrual_base(&stream));
+            math::accrued(stream.rate, elapsed, stream.balance)
+        };
+
+        Ok(stream.balance - accrued)
+    }
+
     /// Bumps a stream's persistent-storage TTL without touching its state.
     ///
     /// # Examples

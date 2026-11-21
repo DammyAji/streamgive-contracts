@@ -626,6 +626,113 @@ fn depletion_time_on_unknown_stream_fails() {
     assert_eq!(result, Err(Ok(Error::StreamNotFound)));
 }
 
+// =============================================================================
+// Issue #345: pending_refund view for donors
+// =============================================================================
+
+#[test]
+fn pending_refund_of_an_active_stream_matches_the_cancel_refund() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 20); // 200 accrues
+
+    // Balance minus the accrued slice.
+    assert_eq!(s.client.pending_refund(&stream_id), 800);
+
+    // Read-only: nothing settled and no funds moved.
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 1_000);
+    assert_eq!(stream.withdrawn, 0);
+    assert_eq!(s.token.balance(&s.ngo), 0);
+
+    // It must equal exactly what cancel_stream actually refunds.
+    let refund = s.client.cancel_stream(&stream_id);
+    assert_eq!(refund, 800);
+}
+
+#[test]
+fn pending_refund_of_a_drained_stream_is_zero() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 500); // the whole balance accrues
+
+    // Until it is settled the balance is still whole, but the accrued slice
+    // already equals it, so nothing would come back.
+    assert_eq!(s.client.pending_refund(&stream_id), 0);
+
+    s.client.withdraw(&stream_id);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 0);
+    assert_eq!(s.client.pending_refund(&stream_id), 0);
+}
+
+#[test]
+fn pending_refund_of_a_cancelled_stream_is_zero() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 20);
+    s.client.cancel_stream(&stream_id);
+
+    // Cancelling zeroes balance and rate, so there is nothing left to refund.
+    assert_eq!(s.client.pending_refund(&stream_id), 0);
+}
+
+#[test]
+fn pending_refund_of_a_paused_stream_is_the_full_balance() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.pause_stream(&stream_id);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // paused: nothing accrues
+
+    // `cancel_stream` settles through `settle`, which accrues nothing for a
+    // paused stream, so the whole remaining balance would come back.
+    assert_eq!(s.client.pending_refund(&stream_id), 1_000);
+}
+
+#[test]
+fn pending_refund_before_a_streams_cliff_is_the_full_balance() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let start = s.env.ledger().timestamp() + 100;
+    let stream_id = s.client.create_stream_with_start(
+        &s.donor,
+        &s.ngo,
+        &s.token.address,
+        &1_000,
+        &10,
+        &start,
+    );
+
+    // Nothing accrues before `start`, so the whole deposit is refundable.
+    assert_eq!(s.client.pending_refund(&stream_id), 1_000);
+
+    s.env.ledger().with_mut(|l| l.timestamp = start + 20); // 200 accrues
+    assert_eq!(s.client.pending_refund(&stream_id), 800);
+}
+
+#[test]
+fn pending_refund_on_unknown_stream_fails() {
+    let s = setup();
+    let result = s.client.try_pending_refund(&999);
+    assert_eq!(result, Err(Ok(Error::StreamNotFound)));
+}
+
 #[test]
 fn withdraw_with_nothing_accrued_fails() {
     let s = setup();

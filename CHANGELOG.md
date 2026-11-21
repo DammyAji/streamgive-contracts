@@ -74,6 +74,12 @@ This project does not yet follow a formal versioning scheme — each contract's
   once `next` reaches the NGO's stream count. `limit` is clamped to
   `MAX_BATCH_WITHDRAW_STREAMS`, and a page that has accrued nothing yields one
   `0` per stream and still advances the cursor rather than failing (#342).
+- `donation-vault`: read-only `pending_refund(stream_id)` view for donors. It
+  returns the refund a `cancel_stream` would make right now — the stream's
+  remaining balance minus what has accrued to the NGO — applying the same rules
+  as `cancel_stream` (cliff and paused streams accrue nothing). A drained or
+  already-cancelled stream reports `0`. It is the donor's mirror of
+  `pending_payout` and never moves funds (#345).
 - Contract events for registry and vault state changes (see
   [`docs/EVENTS.md`](docs/EVENTS.md)).
 - Document storage TTL policy, inactivity expiry risks, and keep-alive entry
