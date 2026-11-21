@@ -55,6 +55,12 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Test (release profile)
+        run: cargo test --workspace --release
+
+      - name: Detect unused dependencies
+        uses: bnjbvr/cargo-machete@main
+
       - name: Hash and upload wasm artifacts
         if: github.ref == 'refs/heads/main'
         run: |
