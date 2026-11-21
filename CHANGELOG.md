@@ -45,6 +45,13 @@ This project does not yet follow a formal versioning scheme — each contract's
 - `ngo-registry`: owner-gated `update_name` for fixing an application's
   name before approval; rejected with `Error::AlreadyVerified` after.
 - `ngo-registry`: read-only `ngo_count` getter for total registered NGOs.
+- `ngo-registry`: optional owner-controlled metadata URI on an NGO entry.
+  `set_metadata_uri` (owner-auth-gated) sets or clears it, `metadata_uri`
+  reads it back, and it is included in `get_ngo`'s `Ngo`. Bounded to
+  `MAX_METADATA_URI_LEN` (512 bytes); a longer value is rejected with
+  `Error::MetadataUriTooLong` (14). Emits a `metadata` event. Unlike the
+  name, it stays editable after approval, so an NGO's website/logo reference
+  can be kept current (#347).
 - Contract events for registry and vault state changes (see
   [`docs/EVENTS.md`](docs/EVENTS.md)).
 - Document storage TTL policy, inactivity expiry risks, and keep-alive entry
@@ -144,6 +151,9 @@ This project does not yet follow a formal versioning scheme — each contract's
   `revoke_ngo(approver: Address, ngo_owner: Address)`) and require the caller to
   be the admin or a listed approver. Integrators calling these entry points must
   pass the authorising address and update their invocation arguments (#349).
+- **BREAKING** `ngo-registry`: the `Ngo` struct gains a
+  `metadata_uri: Option<String>` field, so the value returned by `get_ngo`
+  changes shape. Off-chain decoders of `Ngo` must add the new field (#347).
 - **BREAKING** `donation-vault`: the `withdraw` event data payload now includes
   the payout destination, changing from `(accrued: i128, fee: i128, net: i128)`
   to `(accrued: i128, fee: i128, net: i128, payout: Address)`. Off-chain

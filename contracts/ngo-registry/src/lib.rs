@@ -93,6 +93,13 @@ pub struct ApproverRemovedEvent {
     pub data: (),
 }
 
+#[contractevent(topics = ["metadata"], data_format = "single-value")]
+pub struct MetadataUriSetEvent {
+    #[topic]
+    pub owner: Address,
+    pub metadata_uri: Option<String>,
+}
+
 #[contracttype]
 // Debug and PartialEq let tests assert_eq! on a try_* call’s full
 // Result<Result<Ngo, _>, _> rather than unwrapping it by hand first.
@@ -101,6 +108,11 @@ pub struct Ngo {
     pub owner: Address,
     pub name: String,
     pub verified: bool,
+    /// Optional owner-supplied reference to off-chain metadata (a website,
+    /// description, or logo), so an entry can be linked to what the NGO
+    /// publishes about itself. `None` until the owner calls
+    /// `set_metadata_uri`. Bounded by `MAX_METADATA_URI_LEN`. See issue #347.
+    pub metadata_uri: Option<String>,
 }
 
 /// A single page of the NGO owners index, returned by `list_ngos_page`.
@@ -172,6 +184,9 @@ pub enum Error {
     NotApprover = 12,
     /// `add_approver` was called for an address already in the approver list.
     AlreadyApprover = 13,
+    /// The supplied metadata URI is longer than `MAX_METADATA_URI_LEN`
+    /// (512 bytes).
+    MetadataUriTooLong = 14,
     // Error numbers are append-only: never renumber, reuse, or remove a
     // variant. New errors take the next unused number. See
     // docs/UPGRADE_POLICY.md.
@@ -183,6 +198,11 @@ pub enum Error {
 /// organization name while keeping a single entry's storage bounded.
 /// Note: this is strictly a byte limit (200 bytes), not a character limit.
 pub const MAX_NGO_NAME_LEN: u32 = 200;
+
+/// Upper bound on `Ngo.metadata_uri`, in bytes. As with `MAX_NGO_NAME_LEN`,
+/// this keeps a single entry's storage footprint bounded; 512 bytes fits a
+/// typical URL (including a logo or IPFS reference) with room to spare.
+pub const MAX_METADATA_URI_LEN: u32 = 512;
 
 /// Maximum number of NGO owners returned by `list_ngos` / `list_ngos_page` in
 /// a single page. Caps read footprint, memory, and gas consumption to keep
@@ -322,6 +342,21 @@ fn validate_name(name: &String) -> Result<(), Error> {
     let bytes: Bytes = name.into();
     bytes.copy_into_slice(&mut buf[..len]);
     validate_name_bytes(&buf[..len])
+}
+
+/// Validates an optional NGO metadata URI.
+///
+/// `None` is always allowed. `Some` must be at most `MAX_METADATA_URI_LEN`
+/// (512 bytes) or the call fails with `Error::MetadataUriTooLong`. The URI is
+/// opaque to the contract — an `https://`, `ipfs://`, or any other scheme is
+/// accepted — so only the length is enforced. See issue #347.
+fn validate_metadata_uri(uri: &Option<String>) -> Result<(), Error> {
+    if let Some(u) = uri {
+        if u.len() > MAX_METADATA_URI_LEN {
+            return Err(Error::MetadataUriTooLong);
+        }
+    }
+    Ok(())
 }
 
 /// Reads the configured admin and requires their auth, failing with
@@ -718,6 +753,7 @@ impl NgoRegistry {
             owner: owner.clone(),
             name: name.clone(),
             verified: false,
+            metadata_uri: None,
         };
         env.storage().persistent().set(&key, &ngo);
 
@@ -1208,6 +1244,97 @@ impl NgoRegistry {
         }
 
         Ok(())
+    }
+
+    /// Sets or clears the metadata URI on the caller's own NGO entry, so an
+    /// entry can point at off-chain metadata such as a website, description,
+    /// or logo. Requires the owner's auth; the entry must already be
+    /// registered, or the call fails with `Error::NotRegistered`.
+    ///
+    /// The URI is opaque to the contract — any scheme (`https://`, `ipfs://`,
+    /// …) is accepted — and must be at most `MAX_METADATA_URI_LEN` (512 bytes),
+    /// or the call fails with `Error::MetadataUriTooLong`. Pass `None` to clear
+    /// it. Unlike `update_name`, this is not locked by verification: an NGO can
+    /// keep its published metadata current after approval. Publishes a
+    /// `MetadataUriSetEvent`, but only when the value actually changes. See
+    /// issue #347.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env, String};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(NgoRegistry, ());
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// # let owner = Address::generate(&env);
+    /// # client.register(&owner, &String::from_str(&env, "Example NGO"));
+    /// let uri = Some(String::from_str(&env, "https://example.org/about"));
+    /// client.set_metadata_uri(&owner, &uri);
+    /// assert_eq!(client.get_ngo(&owner).metadata_uri, uri);
+    /// ```
+    pub fn set_metadata_uri(
+        env: Env,
+        owner: Address,
+        metadata_uri: Option<String>,
+    ) -> Result<(), Error> {
+        owner.require_auth();
+
+        validate_metadata_uri(&metadata_uri)?;
+
+        let key = DataKey::Ngo(owner.clone());
+        let mut ngo: Ngo = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotRegistered)?;
+
+        // Only write and emit when the URI actually changes, matching
+        // `update_name`.
+        if ngo.metadata_uri != metadata_uri {
+            ngo.metadata_uri = metadata_uri.clone();
+            env.storage().persistent().set(&key, &ngo);
+            extend_instance_ttl(&env);
+            extend_ngo_ttl(&env, &owner);
+
+            MetadataUriSetEvent { owner, metadata_uri }.publish(&env);
+        }
+
+        Ok(())
+    }
+
+    /// Reads back an NGO's metadata URI, or `None` when it has none set.
+    ///
+    /// Never errors or panics: an unregistered address, and a registered
+    /// entry that hasn't called `set_metadata_uri`, both return `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env, String};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(NgoRegistry, ());
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// # let owner = Address::generate(&env);
+    /// # client.register(&owner, &String::from_str(&env, "Example NGO"));
+    /// assert_eq!(client.metadata_uri(&owner), None);
+    ///
+    /// let uri = Some(String::from_str(&env, "https://example.org"));
+    /// client.set_metadata_uri(&owner, &uri);
+    /// assert_eq!(client.metadata_uri(&owner), uri);
+    /// ```
+    pub fn metadata_uri(env: Env, owner: Address) -> Option<String> {
+        env.storage()
+            .persistent()
+            .get::<_, Ngo>(&DataKey::Ngo(owner))
+            .and_then(|ngo| ngo.metadata_uri)
     }
 
     /// Reads back an NGO's registry entry, registered or not.

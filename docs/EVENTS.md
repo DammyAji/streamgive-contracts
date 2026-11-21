@@ -24,8 +24,9 @@ layout stable. Event type names include `RegisterEvent`, `RenamedEvent`,
 `MaxRateClearedEvent`, `InitializedEvent`,
 `UpgradedEvent`, `UpgradeProposedEvent`, `UpgradeCancelledEvent`,
 `UpgradeDelaySetEvent`, `ApproverAddedEvent`, `ApproverRemovedEvent`,
-`CreatedEvent`, `WithdrawnEvent`, `CancelledStreamEvent`, `RescuedStreamEvent`,
-`ToppedUpEvent`, `RateModifiedEvent`, and `SurplusSweptEvent`.
+`MetadataUriSetEvent`, `CreatedEvent`, `WithdrawnEvent`,
+`CancelledStreamEvent`, `RescuedStreamEvent`, `ToppedUpEvent`,
+`RateModifiedEvent`, and `SurplusSweptEvent`.
 
 `Address`, `i128`, `u64`, `u32`, `bool`, and `String` are the standard
 Soroban SDK/XDR types (`Address` is the SDK's account/contract address
@@ -57,6 +58,22 @@ before it has been approved.
 
 Once an `approved` event has been seen for an `owner`, no further
 `renamed` events can follow for it while it stays verified.
+
+### `metadata`
+
+Emitted by `set_metadata_uri` when an NGO changes the metadata URI on its own
+entry (a reference to off-chain metadata such as a website, description, or
+logo). It fires whenever the stored value changes, including when the URI is
+cleared.
+
+| | |
+|---|---|
+| Topics | `("metadata", owner: Address)` |
+| Data | `metadata_uri: Option<String>` (`None` when cleared) |
+
+Unlike `renamed`, `metadata` can follow an `approved` event: the URI is not
+frozen by verification, so an approved NGO keeps its published reference
+current. The value is at most `MAX_METADATA_URI_LEN` (512 bytes).
 
 ### `approved`
 

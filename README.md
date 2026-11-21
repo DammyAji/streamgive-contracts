@@ -349,7 +349,7 @@ currently allocated up to code 38. See [docs/UPGRADE_POLICY.md](docs/UPGRADE_POL
 
 ### `ngo-registry`
 
-Codes 1–13 are the full `Error` enum. The same append-only rule applies. Admin-gated entry points first call
+Codes 1–14 are the full `Error` enum. The same append-only rule applies. Admin-gated entry points first call
 `require_admin`, and the review entry points first call `require_approver`, so they can also return
 `NotInitialized` or `NotApprover`. The admin is an implicit approver: the
 registry keeps an admin-managed list of additional addresses permitted to
@@ -362,7 +362,7 @@ key.
 | 1 | `AlreadyInitialized` | `init` already created an admin. | `init` |
 | 2 | `NotInitialized` | No admin is stored. | `admin`, `propose_admin`, `cancel_admin_proposal`, `approve_ngo`, `batch_approve`, `reject_ngo`, `revoke_ngo`, `add_approver`, `remove_approver`, `upgrade` |
 | 3 | `AlreadyRegistered` | The owner already has a registry entry. | `register` |
-| 4 | `NotRegistered` | No entry exists for the owner. | `unregister`, `update_name`, `get_ngo`, `approve_ngo`, `batch_approve`, `reject_ngo`, `revoke_ngo`, `touch_ngo` |
+| 4 | `NotRegistered` | No entry exists for the owner. | `unregister`, `update_name`, `set_metadata_uri`, `get_ngo`, `approve_ngo`, `batch_approve`, `reject_ngo`, `revoke_ngo`, `touch_ngo` |
 | 5 | `AlreadyVerified` | The action is not allowed once an NGO is verified: unregister, rename, reject, or approve again. | `unregister`, `update_name`, `approve_ngo`, `batch_approve`, `reject_ngo` |
 | 6 | `NameTooLong` | Name exceeds 200 bytes. | `register`, `update_name` |
 | 7 | `NotVerified` | `revoke_ngo` called on an NGO that is not verified. | `revoke_ngo` |
@@ -372,6 +372,7 @@ key.
 | 11 | `InvalidName` | The name is empty or whitespace-only. | `register` |
 | 12 | `NotApprover` | The acting address is neither the admin nor on the approver list. | `approve_ngo`, `batch_approve`, `reject_ngo`, `revoke_ngo`, `remove_approver` |
 | 13 | `AlreadyApprover` | The address is already on the approver list. | `add_approver` |
+| 14 | `MetadataUriTooLong` | The metadata URI exceeds 512 bytes. | `set_metadata_uri` |
 
 ## Status
 

@@ -175,6 +175,202 @@ fn update_name_accepts_name_at_max_length() {
     assert_eq!(client.get_ngo(&owner).name, at_limit);
 }
 
+// =============================================================================
+// metadata URI (issue #347)
+// =============================================================================
+
+#[test]
+fn register_defaults_metadata_uri_to_none() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    assert_eq!(client.get_ngo(&owner).metadata_uri, None);
+    assert_eq!(client.metadata_uri(&owner), None);
+}
+
+#[test]
+fn metadata_uri_getter_returns_none_for_unregistered_address() {
+    let (env, client, _admin) = setup();
+    let stranger = Address::generate(&env);
+
+    assert_eq!(client.metadata_uri(&stranger), None);
+}
+
+#[test]
+fn set_metadata_uri_stores_uri_and_publishes_event() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    let uri = Some(String::from_str(&env, "https://example.org/about"));
+    client.set_metadata_uri(&owner, &uri);
+
+    // Events cover only the latest top-level call, so assert before get_ngo.
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("metadata"), owner.clone()).into_val(&env),
+                uri.clone().into_val(&env),
+            ),
+        ]
+    );
+
+    assert_eq!(client.get_ngo(&owner).metadata_uri, uri);
+    assert_eq!(client.metadata_uri(&owner), uri);
+}
+
+#[test]
+fn set_metadata_uri_clears_with_none() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.set_metadata_uri(&owner, &Some(String::from_str(&env, "https://example.org")));
+
+    client.set_metadata_uri(&owner, &None);
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("metadata"), owner.clone()).into_val(&env),
+                None::<String>.into_val(&env),
+            ),
+        ]
+    );
+    assert_eq!(client.get_ngo(&owner).metadata_uri, None);
+    assert_eq!(client.metadata_uri(&owner), None);
+}
+
+#[test]
+fn set_metadata_uri_no_event_when_unchanged() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    let uri = Some(String::from_str(&env, "https://example.org"));
+    client.set_metadata_uri(&owner, &uri);
+
+    // Re-setting the same value writes nothing and emits nothing.
+    client.set_metadata_uri(&owner, &uri);
+
+    assert_eq!(env.events().all().events().len(), 0);
+}
+
+#[test]
+fn set_metadata_uri_accepts_uri_at_max_length() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    // Exactly MAX_METADATA_URI_LEN (512) bytes.
+    let at_limit = String::from_bytes(&env, &[b'a'; MAX_METADATA_URI_LEN as usize]);
+    client.set_metadata_uri(&owner, &Some(at_limit.clone()));
+
+    assert_eq!(client.get_ngo(&owner).metadata_uri, Some(at_limit));
+}
+
+#[test]
+fn set_metadata_uri_rejects_uri_over_max_length() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    // MAX_METADATA_URI_LEN (512) + 1 bytes.
+    let too_long = String::from_bytes(&env, &[b'a'; MAX_METADATA_URI_LEN as usize + 1]);
+    let result = client.try_set_metadata_uri(&owner, &Some(too_long));
+
+    assert_eq!(result, Err(Ok(Error::MetadataUriTooLong)));
+    // The entry is left untouched.
+    assert_eq!(client.get_ngo(&owner).metadata_uri, None);
+}
+
+#[test]
+fn set_metadata_uri_for_unregistered_ngo_fails() {
+    let (env, client, _admin) = setup();
+    let stranger = Address::generate(&env);
+
+    let result = client.try_set_metadata_uri(
+        &stranger,
+        &Some(String::from_str(&env, "https://example.org")),
+    );
+
+    assert_eq!(result, Err(Ok(Error::NotRegistered)));
+}
+
+#[test]
+fn set_metadata_uri_requires_owner_auth() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    client.set_metadata_uri(&owner, &Some(String::from_str(&env, "https://example.org")));
+
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1);
+    let (address, invocation) = &auths[0];
+    assert_eq!(address, &owner);
+    match &invocation.function {
+        AuthorizedFunction::Contract((contract, function, _)) => {
+            assert_eq!(contract, &client.address);
+            assert_eq!(function, &Symbol::new(&env, "set_metadata_uri"));
+        }
+        _ => panic!("expected a contract invocation"),
+    }
+}
+
+#[test]
+fn set_metadata_uri_remains_allowed_after_approval() {
+    let (env, client, admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&admin, &owner);
+
+    // Unlike the name, the metadata URI is not frozen by verification.
+    let uri = Some(String::from_str(&env, "https://example.org/logo.svg"));
+    client.set_metadata_uri(&owner, &uri);
+
+    let ngo = client.get_ngo(&owner);
+    assert!(ngo.verified);
+    assert_eq!(ngo.metadata_uri, uri);
+}
+
+#[test]
+fn set_metadata_uri_bumps_instance_and_ngo_ttl() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    age_past_thresholds(&env, &client, &owner);
+
+    client.set_metadata_uri(&owner, &Some(String::from_str(&env, "https://example.org")));
+
+    assert_ttls_bumped(&env, &client, &owner);
+}
+
+#[test]
+fn get_ngo_includes_metadata_uri() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    let name = String::from_str(&env, "Red Cross");
+    client.register(&owner, &name);
+    let uri = Some(String::from_str(&env, "https://example.org"));
+    client.set_metadata_uri(&owner, &uri);
+
+    assert_eq!(
+        client.get_ngo(&owner),
+        Ngo {
+            owner: owner.clone(),
+            name,
+            verified: false,
+            metadata_uri: uri,
+        }
+    );
+}
+
 #[test]
 fn register_and_update_name_unicode_whitespace_only_fails() {
     let (env, client, _admin) = setup();
@@ -776,6 +972,7 @@ fn update_name_changes_name_before_approval() {
             owner: owner.clone(),
             name: fixed.clone(),
             verified: false,
+            metadata_uri: None,
         }
     );
 }
@@ -831,6 +1028,7 @@ fn update_name_after_revocation_succeeds() {
             owner: owner.clone(),
             name: fixed,
             verified: false,
+            metadata_uri: None,
         }
     );
 }
