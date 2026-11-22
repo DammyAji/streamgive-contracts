@@ -5448,15 +5448,20 @@ fn create_stream_rejects_vault_as_ngo() {
     s.token_admin.mint(&s.donor, &1_000);
 
     let vault = s.client.address.clone();
+    let donor_balance_before = s.token.balance(&s.donor);
+    
     let result = s
         .client
         .try_create_stream(&s.donor, &vault, &s.token.address, &1_000, &10);
     assert_eq!(result, Err(Ok(Error::InvalidNgo)));
 
-    // Nothing written, nothing moved.
+    // Nothing written: no stream created, no counter incremented, no donor count updated
     assert_eq!(s.client.stream_count(), 0);
     assert_eq!(s.client.total_donated(), 0);
-    assert_eq!(s.token.balance(&s.donor), 1_000);
+    assert_eq!(s.client.streams_by_donor(&s.donor).len(), 0);
+    
+    // No funds moved: donor keeps all tokens, vault has none
+    assert_eq!(s.token.balance(&s.donor), donor_balance_before);
     assert_eq!(s.token.balance(&vault), 0);
 }
 
@@ -5466,16 +5471,41 @@ fn create_stream_rejects_vault_as_token() {
     s.token_admin.mint(&s.donor, &1_000);
 
     let vault = s.client.address.clone();
+    let donor_balance_before = s.token.balance(&s.donor);
+    
     let result = s
         .client
         .try_create_stream(&s.donor, &s.ngo, &vault, &1_000, &10);
     assert_eq!(result, Err(Ok(Error::InvalidToken)));
 
-    // Nothing written, nothing moved.
+    // Nothing written: no stream created, no counter incremented, no donor count updated
     assert_eq!(s.client.stream_count(), 0);
     assert_eq!(s.client.total_donated(), 0);
     assert_eq!(s.client.streams_by_donor(&s.donor).len(), 0);
-    assert_eq!(s.token.balance(&s.donor), 1_000);
+    
+    // No funds moved: donor keeps all tokens (the real token balance)
+    assert_eq!(s.token.balance(&s.donor), donor_balance_before);
+}
+
+#[test]
+fn create_stream_checks_vault_address_before_other_validations() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let vault = s.client.address.clone();
+    
+    // Even with invalid amounts, vault address check comes first
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &vault, &s.token.address, &0, &10);
+    assert_eq!(result, Err(Ok(Error::InvalidNgo)),
+        "InvalidNgo should be returned before InvalidAmount");
+    
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &vault, &1_000, &0);
+    assert_eq!(result, Err(Ok(Error::InvalidToken)),
+        "InvalidToken should be returned before InvalidAmount");
 }
 
 // =============================================================================
