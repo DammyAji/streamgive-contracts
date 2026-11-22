@@ -904,6 +904,117 @@ fn unpause_rejects_duplicate_unpause() {
 }
 
 #[test]
+fn pause_blocks_fund_movement_but_allows_cancel_and_queries() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &3_000);
+    let treasury = Address::generate(&s.env);
+    let new_admin = Address::generate(&s.env);
+
+    // Create a stream before pausing
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 10); // 100 accrues
+
+    s.client.pause();
+    assert!(s.client.paused());
+
+    // Fund-moving operations are blocked
+    assert_eq!(
+        s.client.try_create_stream(&s.donor, &s.ngo, &s.token.address, &500, &10),
+        Err(Ok(Error::ContractPaused)),
+        "create_stream should be blocked"
+    );
+    assert_eq!(
+        s.client.try_withdraw(&stream_id),
+        Err(Ok(Error::ContractPaused)),
+        "withdraw should be blocked"
+    );
+    assert_eq!(
+        s.client.try_top_up(&stream_id, &500),
+        Err(Ok(Error::ContractPaused)),
+        "top_up should be blocked"
+    );
+    assert_eq!(
+        s.client.try_modify_rate(&stream_id, &20),
+        Err(Ok(Error::ContractPaused)),
+        "modify_rate should be blocked"
+    );
+    assert_eq!(
+        s.client.try_transfer_stream(&stream_id, &Address::generate(&s.env)),
+        Err(Ok(Error::ContractPaused)),
+        "transfer_stream should be blocked"
+    );
+    assert_eq!(
+        s.client.try_pause_stream(&stream_id),
+        Err(Ok(Error::ContractPaused)),
+        "pause_stream should be blocked"
+    );
+    assert_eq!(
+        s.client.try_resume_stream(&stream_id),
+        Err(Ok(Error::ContractPaused)),
+        "resume_stream should be blocked"
+    );
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(stream_id);
+    assert_eq!(
+        s.client.try_withdraw_batch(&ids),
+        Err(Ok(Error::ContractPaused)),
+        "withdraw_batch should be blocked"
+    );
+    assert_eq!(
+        s.client.try_withdraw_all(&s.ngo, &0, &10),
+        Err(Ok(Error::ContractPaused)),
+        "withdraw_all should be blocked"
+    );
+    assert_eq!(
+        s.client.try_sweep_surplus(&s.token.address, &100),
+        Err(Ok(Error::ContractPaused)),
+        "sweep_surplus should be blocked"
+    );
+
+    // cancel_stream always works (emergency exit for donors)
+    let refund = s.client.cancel_stream(&stream_id);
+    assert_eq!(refund, 900); // 1000 - 100 that accrued
+    assert_eq!(s.token.balance(&s.ngo), 100);
+    assert_eq!(s.token.balance(&s.donor), 2_100);
+
+    // rescue_stream requires the vault to be paused
+    s.token_admin.mint(&s.donor, &500);
+    let stream_id2 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &500, &10);
+    s.client.pause();
+    let rescued = s.client.rescue_stream(&stream_id2);
+    assert_eq!(rescued, 500);
+    assert_eq!(s.token.balance(&s.donor), 2_600);
+
+    // Read-only operations still work
+    assert!(s.client.get_stream(&stream_id).cancelled);
+    assert_eq!(s.client.pending_accrual(&stream_id2), 0);
+    assert_eq!(s.client.depletion_time(&stream_id2), None);
+    assert_eq!(s.client.total_donated(), 1_500);
+
+    // Admin operations still work
+    s.client.set_treasury(&treasury);
+    assert_eq!(s.client.treasury(), Some(treasury.clone()));
+    s.client.set_fee_bps(&100);
+    assert_eq!(s.client.fee_bps(), 100);
+    s.client.set_min_deposit(&50);
+    assert_eq!(s.client.min_deposit(), 50);
+    s.client.set_max_streams_per_donor(&200);
+    assert_eq!(s.client.max_streams_per_donor(), 200);
+    s.client.propose_admin(&new_admin);
+    assert_eq!(s.client.pending_admin(), Some(new_admin.clone()));
+    s.client.cancel_admin_proposal();
+    assert_eq!(s.client.pending_admin(), None);
+
+    // unpause restores normal operation
+    s.client.unpause();
+    assert!(!s.client.paused());
+}
+
+#[test]
 fn withdraw_with_no_treasury_takes_no_fee() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
