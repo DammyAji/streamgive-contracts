@@ -2652,6 +2652,61 @@ fn modify_rate_past_i128_max_withdrawn_returns_overflow_error() {
     assert_eq!(s.client.get_stream(&stream_id).rate, 10);
 }
 
+#[test]
+fn create_and_top_up_near_i128_max() {
+    let s = setup();
+    // Create a stream with a deposit near i128::MAX
+    let max_deposit = i128::MAX - 1000;
+    s.token_admin.mint(&s.donor, &max_deposit);
+    s.token_admin.mint(&s.donor, &2000); // Extra for top-ups
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &max_deposit, &10);
+
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, max_deposit);
+    assert_eq!(stream.rate, 10);
+    assert_eq!(s.token.balance(&s.client.address), max_deposit);
+
+    // Advance time and withdraw to reduce balance
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
+    let withdrawn = s.client.withdraw(&stream_id);
+    assert_eq!(withdrawn, 500);
+    assert_eq!(s.client.get_stream(&stream_id).balance, max_deposit - 500);
+
+    // Top-up with an amount that would stay within bounds
+    s.client.top_up(&stream_id, &100);
+    assert_eq!(
+        s.client.get_stream(&stream_id).balance,
+        max_deposit - 500 + 100
+    );
+
+    // Attempt to top up beyond i128::MAX should fail
+    let overflow_amount = 1000; // Would push balance past i128::MAX
+    let result = s.client.try_top_up(&stream_id, &overflow_amount);
+    assert_eq!(result, Err(Ok(Error::ArithmeticOverflow)));
+
+    // Stream and balances should be unchanged after the failed top-up
+    assert_eq!(
+        s.client.get_stream(&stream_id).balance,
+        max_deposit - 500 + 100
+    );
+    assert_eq!(
+        s.token.balance(&s.donor),
+        2000 - 100 // Still has the amount that failed to top up
+    );
+    assert_eq!(
+        s.token.balance(&s.client.address),
+        max_deposit - 500 + 100
+    );
+
+    // Cancel should work and return the remaining balance
+    let refund = s.client.cancel_stream(&stream_id);
+    assert_eq!(refund, max_deposit - 500 + 100);
+    assert_eq!(s.token.balance(&s.donor), 2000 - 100 + refund);
+}
+
 /// Asserts that the last top-level call required auth from exactly one
 /// address, `expected`, and that it was for `fn_name` on the vault.
 /// mock_all_auths() lets any require_auth pass, so without this a
