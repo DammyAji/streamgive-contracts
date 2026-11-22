@@ -5352,6 +5352,92 @@ fn modify_rate_increase_for_verified_ngo_succeeds() {
     assert_eq!(s.client.get_stream(&stream_id).rate, 20);
 }
 
+#[test]
+fn modify_rate_increase_rejects_unverified_ngo() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Register but don't approve the NGO
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Attempting to increase rate should fail with NgoNotVerified
+    let result = s.client.try_modify_rate(&stream_id, &20);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    // Stream state should be unchanged
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.rate, 10);
+    assert_eq!(stream.balance, 1_000);
+}
+
+#[test]
+fn modify_rate_decrease_allows_unverified_ngo() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Register but don't approve the NGO
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Decreasing rate should succeed even for unverified NGO
+    s.client.modify_rate(&stream_id, &5);
+    assert_eq!(s.client.get_stream(&stream_id).rate, 5);
+}
+
+#[test]
+fn modify_rate_increase_rejects_revoked_ngo() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Register and approve the NGO
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Revoke the NGO after creation
+    registry.revoke_ngo(&s.client.admin(), &s.ngo);
+
+    // Attempting to increase rate should fail with NgoNotVerified
+    let result = s.client.try_modify_rate(&stream_id, &20);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    // Stream state should be unchanged
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.rate, 10);
+    assert_eq!(stream.balance, 1_000);
+}
+
+#[test]
+fn modify_rate_decrease_allows_revoked_ngo() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Register and approve the NGO
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Revoke the NGO after creation
+    registry.revoke_ngo(&s.client.admin(), &s.ngo);
+
+    // Decreasing rate should succeed even after revocation
+    s.client.modify_rate(&stream_id, &5);
+    assert_eq!(s.client.get_stream(&stream_id).rate, 5);
+}
+
 // =============================================================================
 // create_stream rejects the vault's own address (issue #331)
 // =============================================================================
