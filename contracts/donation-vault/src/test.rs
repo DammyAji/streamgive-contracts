@@ -904,6 +904,117 @@ fn unpause_rejects_duplicate_unpause() {
 }
 
 #[test]
+fn pause_blocks_fund_movement_but_allows_cancel_and_queries() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &3_000);
+    let treasury = Address::generate(&s.env);
+    let new_admin = Address::generate(&s.env);
+
+    // Create a stream before pausing
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 10); // 100 accrues
+
+    s.client.pause();
+    assert!(s.client.paused());
+
+    // Fund-moving operations are blocked
+    assert_eq!(
+        s.client.try_create_stream(&s.donor, &s.ngo, &s.token.address, &500, &10),
+        Err(Ok(Error::ContractPaused)),
+        "create_stream should be blocked"
+    );
+    assert_eq!(
+        s.client.try_withdraw(&stream_id),
+        Err(Ok(Error::ContractPaused)),
+        "withdraw should be blocked"
+    );
+    assert_eq!(
+        s.client.try_top_up(&stream_id, &500),
+        Err(Ok(Error::ContractPaused)),
+        "top_up should be blocked"
+    );
+    assert_eq!(
+        s.client.try_modify_rate(&stream_id, &20),
+        Err(Ok(Error::ContractPaused)),
+        "modify_rate should be blocked"
+    );
+    assert_eq!(
+        s.client.try_transfer_stream(&stream_id, &Address::generate(&s.env)),
+        Err(Ok(Error::ContractPaused)),
+        "transfer_stream should be blocked"
+    );
+    assert_eq!(
+        s.client.try_pause_stream(&stream_id),
+        Err(Ok(Error::ContractPaused)),
+        "pause_stream should be blocked"
+    );
+    assert_eq!(
+        s.client.try_resume_stream(&stream_id),
+        Err(Ok(Error::ContractPaused)),
+        "resume_stream should be blocked"
+    );
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(stream_id);
+    assert_eq!(
+        s.client.try_withdraw_batch(&ids),
+        Err(Ok(Error::ContractPaused)),
+        "withdraw_batch should be blocked"
+    );
+    assert_eq!(
+        s.client.try_withdraw_all(&s.ngo, &0, &10),
+        Err(Ok(Error::ContractPaused)),
+        "withdraw_all should be blocked"
+    );
+    assert_eq!(
+        s.client.try_sweep_surplus(&s.token.address, &100),
+        Err(Ok(Error::ContractPaused)),
+        "sweep_surplus should be blocked"
+    );
+
+    // cancel_stream always works (emergency exit for donors)
+    let refund = s.client.cancel_stream(&stream_id);
+    assert_eq!(refund, 900); // 1000 - 100 that accrued
+    assert_eq!(s.token.balance(&s.ngo), 100);
+    assert_eq!(s.token.balance(&s.donor), 2_100);
+
+    // rescue_stream requires the vault to be paused
+    s.token_admin.mint(&s.donor, &500);
+    let stream_id2 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &500, &10);
+    s.client.pause();
+    let rescued = s.client.rescue_stream(&stream_id2);
+    assert_eq!(rescued, 500);
+    assert_eq!(s.token.balance(&s.donor), 2_600);
+
+    // Read-only operations still work
+    assert!(s.client.get_stream(&stream_id).cancelled);
+    assert_eq!(s.client.pending_accrual(&stream_id2), 0);
+    assert_eq!(s.client.depletion_time(&stream_id2), None);
+    assert_eq!(s.client.total_donated(), 1_500);
+
+    // Admin operations still work
+    s.client.set_treasury(&treasury);
+    assert_eq!(s.client.treasury(), Some(treasury.clone()));
+    s.client.set_fee_bps(&100);
+    assert_eq!(s.client.fee_bps(), 100);
+    s.client.set_min_deposit(&50);
+    assert_eq!(s.client.min_deposit(), 50);
+    s.client.set_max_streams_per_donor(&200);
+    assert_eq!(s.client.max_streams_per_donor(), 200);
+    s.client.propose_admin(&new_admin);
+    assert_eq!(s.client.pending_admin(), Some(new_admin.clone()));
+    s.client.cancel_admin_proposal();
+    assert_eq!(s.client.pending_admin(), None);
+
+    // unpause restores normal operation
+    s.client.unpause();
+    assert!(!s.client.paused());
+}
+
+#[test]
 fn withdraw_with_no_treasury_takes_no_fee() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
@@ -2539,6 +2650,61 @@ fn modify_rate_past_i128_max_withdrawn_returns_overflow_error() {
     let result = s.client.try_modify_rate(&stream_id, &20);
     assert_eq!(result, Err(Ok(Error::ArithmeticOverflow)));
     assert_eq!(s.client.get_stream(&stream_id).rate, 10);
+}
+
+#[test]
+fn create_and_top_up_near_i128_max() {
+    let s = setup();
+    // Create a stream with a deposit near i128::MAX
+    let max_deposit = i128::MAX - 1000;
+    s.token_admin.mint(&s.donor, &max_deposit);
+    s.token_admin.mint(&s.donor, &2000); // Extra for top-ups
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &max_deposit, &10);
+
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, max_deposit);
+    assert_eq!(stream.rate, 10);
+    assert_eq!(s.token.balance(&s.client.address), max_deposit);
+
+    // Advance time and withdraw to reduce balance
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
+    let withdrawn = s.client.withdraw(&stream_id);
+    assert_eq!(withdrawn, 500);
+    assert_eq!(s.client.get_stream(&stream_id).balance, max_deposit - 500);
+
+    // Top-up with an amount that would stay within bounds
+    s.client.top_up(&stream_id, &100);
+    assert_eq!(
+        s.client.get_stream(&stream_id).balance,
+        max_deposit - 500 + 100
+    );
+
+    // Attempt to top up beyond i128::MAX should fail
+    let overflow_amount = 1000; // Would push balance past i128::MAX
+    let result = s.client.try_top_up(&stream_id, &overflow_amount);
+    assert_eq!(result, Err(Ok(Error::ArithmeticOverflow)));
+
+    // Stream and balances should be unchanged after the failed top-up
+    assert_eq!(
+        s.client.get_stream(&stream_id).balance,
+        max_deposit - 500 + 100
+    );
+    assert_eq!(
+        s.token.balance(&s.donor),
+        2000 - 100 // Still has the amount that failed to top up
+    );
+    assert_eq!(
+        s.token.balance(&s.client.address),
+        max_deposit - 500 + 100
+    );
+
+    // Cancel should work and return the remaining balance
+    let refund = s.client.cancel_stream(&stream_id);
+    assert_eq!(refund, max_deposit - 500 + 100);
+    assert_eq!(s.token.balance(&s.donor), 2000 - 100 + refund);
 }
 
 /// Asserts that the last top-level call required auth from exactly one
@@ -5186,6 +5352,92 @@ fn modify_rate_increase_for_verified_ngo_succeeds() {
     assert_eq!(s.client.get_stream(&stream_id).rate, 20);
 }
 
+#[test]
+fn modify_rate_increase_rejects_unverified_ngo() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Register but don't approve the NGO
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Attempting to increase rate should fail with NgoNotVerified
+    let result = s.client.try_modify_rate(&stream_id, &20);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    // Stream state should be unchanged
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.rate, 10);
+    assert_eq!(stream.balance, 1_000);
+}
+
+#[test]
+fn modify_rate_decrease_allows_unverified_ngo() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Register but don't approve the NGO
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Decreasing rate should succeed even for unverified NGO
+    s.client.modify_rate(&stream_id, &5);
+    assert_eq!(s.client.get_stream(&stream_id).rate, 5);
+}
+
+#[test]
+fn modify_rate_increase_rejects_revoked_ngo() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Register and approve the NGO
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Revoke the NGO after creation
+    registry.revoke_ngo(&s.client.admin(), &s.ngo);
+
+    // Attempting to increase rate should fail with NgoNotVerified
+    let result = s.client.try_modify_rate(&stream_id, &20);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    // Stream state should be unchanged
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.rate, 10);
+    assert_eq!(stream.balance, 1_000);
+}
+
+#[test]
+fn modify_rate_decrease_allows_revoked_ngo() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Register and approve the NGO
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Revoke the NGO after creation
+    registry.revoke_ngo(&s.client.admin(), &s.ngo);
+
+    // Decreasing rate should succeed even after revocation
+    s.client.modify_rate(&stream_id, &5);
+    assert_eq!(s.client.get_stream(&stream_id).rate, 5);
+}
+
 // =============================================================================
 // create_stream rejects the vault's own address (issue #331)
 // =============================================================================
@@ -5196,15 +5448,20 @@ fn create_stream_rejects_vault_as_ngo() {
     s.token_admin.mint(&s.donor, &1_000);
 
     let vault = s.client.address.clone();
+    let donor_balance_before = s.token.balance(&s.donor);
+    
     let result = s
         .client
         .try_create_stream(&s.donor, &vault, &s.token.address, &1_000, &10);
     assert_eq!(result, Err(Ok(Error::InvalidNgo)));
 
-    // Nothing written, nothing moved.
+    // Nothing written: no stream created, no counter incremented, no donor count updated
     assert_eq!(s.client.stream_count(), 0);
     assert_eq!(s.client.total_donated(), 0);
-    assert_eq!(s.token.balance(&s.donor), 1_000);
+    assert_eq!(s.client.streams_by_donor(&s.donor).len(), 0);
+    
+    // No funds moved: donor keeps all tokens, vault has none
+    assert_eq!(s.token.balance(&s.donor), donor_balance_before);
     assert_eq!(s.token.balance(&vault), 0);
 }
 
@@ -5214,16 +5471,41 @@ fn create_stream_rejects_vault_as_token() {
     s.token_admin.mint(&s.donor, &1_000);
 
     let vault = s.client.address.clone();
+    let donor_balance_before = s.token.balance(&s.donor);
+    
     let result = s
         .client
         .try_create_stream(&s.donor, &s.ngo, &vault, &1_000, &10);
     assert_eq!(result, Err(Ok(Error::InvalidToken)));
 
-    // Nothing written, nothing moved.
+    // Nothing written: no stream created, no counter incremented, no donor count updated
     assert_eq!(s.client.stream_count(), 0);
     assert_eq!(s.client.total_donated(), 0);
     assert_eq!(s.client.streams_by_donor(&s.donor).len(), 0);
-    assert_eq!(s.token.balance(&s.donor), 1_000);
+    
+    // No funds moved: donor keeps all tokens (the real token balance)
+    assert_eq!(s.token.balance(&s.donor), donor_balance_before);
+}
+
+#[test]
+fn create_stream_checks_vault_address_before_other_validations() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let vault = s.client.address.clone();
+    
+    // Even with invalid amounts, vault address check comes first
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &vault, &s.token.address, &0, &10);
+    assert_eq!(result, Err(Ok(Error::InvalidNgo)),
+        "InvalidNgo should be returned before InvalidAmount");
+    
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &vault, &1_000, &0);
+    assert_eq!(result, Err(Ok(Error::InvalidToken)),
+        "InvalidToken should be returned before InvalidAmount");
 }
 
 // =============================================================================
