@@ -6486,3 +6486,182 @@ fn roles_doc_lists_every_entry_point() {
         );
     }
 }
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 100);
+
+    s.client.transfer_stream(&stream_id, &new_ngo);
+
+    assert_eq!(
+        s.client.get_stream(&stream_id).status,
+        StreamStatus::Drained
+    );
+    assert_nth_last_event(
+        &s.env,
+        1,
+        (symbol_short!("drained"), stream_id),
+        (1_000i128,),
+    );
+    assert_last_event(
+        &s.env,
+        (symbol_short!("transfer"), stream_id),
+        (s.ngo.clone(), new_ngo.clone(), 1_000i128),
+    );
+}
+
+// =============================================================================
+// Property tests for fee calculation invariants (Issue 1)
+// =============================================================================
+
+#[cfg(test)]
+mod proptest_fee_invariants {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Property test: fee + net always equals accrued for any rate, elapsed time,
+    /// and fee settings, and no value is negative.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1000))]
+
+        #[test]
+        fn fee_plus_net_equals_accrued(
+            rate in 1i128..=1_000_000i128,
+            elapsed in 1u64..=86_400u64,
+            balance in 1_000i128..=1_000_000_000i128,
+            fee_bps in 0u32..=1_000u32,
+        ) {
+            let s = setup();
+            s.token_admin.mint(&s.donor, &balance);
+            
+            let treasury = Address::generate(&s.env);
+            s.client.set_treasury(&treasury);
+            s.client.set_fee_bps(&fee_bps);
+
+            let stream_id = s
+                .client
+                .create_stream(&s.donor, &s.ngo, &s.token.address, &balance, &rate);
+
+            s.env.ledger().with_mut(|l| l.timestamp += elapsed);
+
+            let accrued = s.client.pending_accrual(&stream_id);
+            let net = s.client.withdraw(&stream_id);
+            let fee_balance = s.token.balance(&treasury);
+
+            // Core invariant: fee + net == accrued
+            prop_assert_eq!(fee_balance + net, accrued);
+            
+            // No value should be negative
+            prop_assert!(fee_balance >= 0);
+            prop_assert!(net >= 0);
+            prop_assert!(accrued >= 0);
+            
+            // Net should never exceed accrued
+            prop_assert!(net <= accrued);
+        }
+    }
+}
+
+// =============================================================================
+// Tests for accrual after very long elapsed times (Issue 2)
+// =============================================================================
+
+#[test]
+fn accrual_after_very_long_elapsed_time_is_capped_by_balance() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000_000, &1_000);
+
+    // Advance time to near u64::MAX
+    s.env.ledger().with_mut(|l| l.timestamp += u64::MAX - 1000);
+
+    // Despite the enormous elapsed time, accrual should be capped at the balance
+    let accrued = s.client.pending_accrual(&stream_id);
+    assert_eq!(accrued, 1_000_000);
+}
+
+#[test]
+fn accrual_with_max_elapsed_and_large_rate_never_overflows() {
+    let s = setup();
+    let balance: i128 = 10_000_000_000;
+    s.token_admin.mint(&s.donor, &balance);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &balance, &i128::MAX / 2);
+
+    // Advance time to u64::MAX
+    s.env.ledger().with_mut(|l| l.timestamp += u64::MAX);
+
+    // Despite rate * elapsed overflowing, accrual should be capped at balance
+    let accrued = s.client.pending_accrual(&stream_id);
+    assert_eq!(accrued, balance);
+}
+
+#[test]
+fn accrual_near_u64_max_with_various_rates() {
+    let s = setup();
+    let balance: i128 = i128::MAX;
+    let elapsed = u64::MAX - 100;
+
+    for rate in [1i128, 100, 10_000, 1_000_000, i128::MAX / 2] {
+        s.token_admin.mint(&s.donor, &balance);
+        
+        let stream_id = s
+            .client
+            .create_stream(&s.donor, &s.ngo, &s.token.address, &balance, &rate);
+
+        s.env.ledger().with_mut(|l| l.timestamp += elapsed);
+
+        // Should always be capped at balance, never overflow or panic
+        let accrued = s.client.pending_accrual(&stream_id);
+        assert!(accrued >= 0);
+        assert!(accrued <= balance);
+        
+        s.client.cancel_stream(&stream_id);
+    }
+}
+
+// =============================================================================
+// Tests for default per-donor stream cap (Issue 3)
+// =============================================================================
+
+#[test]
+fn default_stream_cap_allows_exactly_100_streams() {
+    let s = setup();
+    let balance_per_stream: i128 = 1_000;
+    let total_balance = balance_per_stream * 100;
+    s.token_admin.mint(&s.donor, &total_balance);
+
+    // Create exactly 100 streams (the default cap)
+    for _ in 0..100 {
+        s.client
+            .create_stream(&s.donor, &s.ngo, &s.token.address, &balance_per_stream, &10);
+    }
+
+    // The 101st stream should fail with StreamLimitExceeded
+    s.token_admin.mint(&s.donor, &balance_per_stream);
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &balance_per_stream, &10);
+    assert_eq!(result, Err(Ok(Error::StreamLimitExceeded)));
+}
+
+#[test]
+fn streams_by_donor_handles_default_cap() {
+    let s = setup();
+    let balance_per_stream: i128 = 1_000;
+    let total_balance = balance_per_stream * 100;
+    s.token_admin.mint(&s.donor, &total_balance);
+
+    // Create exactly 100 streams
+    for _ in 0..100 {
+        s.client
+            .create_stream(&s.donor, &s.ngo, &s.token.address, &balance_per_stream, &10);
+    }
+
+    // streams_by_donor should successfully return all 100 streams
+    let streams = s.client.streams_by_donor(&s.donor);
+    assert_eq!(streams.len(), 100);
+}
