@@ -12,6 +12,8 @@ testing, deployment, pausing, and error codes, see the
 | [EVENTS.md](./EVENTS.md) | Every event the contracts publish, with its topics and data shape, for writing an indexer. |
 | [FEES.md](./FEES.md) | How the protocol fee is calculated, rounded, and paid to the treasury, with worked examples. |
 | [STORAGE.md](./STORAGE.md) | Which storage type each `DataKey` uses, the TTL policy, and the keep-alive entry points that prevent archival. |
+| [GLOSSARY.md](./GLOSSARY.md) | Precise definitions and examples for terms used in the stream lifecycle. |
+| [CLI.md](./CLI.md) | Copy-ready Stellar CLI commands for common testnet operations. |
 | [GAS.md](./GAS.md) | How to simulate each entry point with the `stellar` CLI and read its resource cost. |
 | [THREAT_MODEL.md](./THREAT_MODEL.md) | What the contracts protect, who they defend against, what the admin can and cannot do, and which risks are accepted. |
 | [UPGRADE_POLICY.md](./UPGRADE_POLICY.md) | What integrators can rely on between releases: append-only error codes and the rules for storage-layout changes. |
