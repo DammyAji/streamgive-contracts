@@ -568,6 +568,9 @@ a drain.
 ### `cancel`
 
 Emitted by `cancel_stream` when a donor stops a stream for good.
+`cancel_streams` emits one of these per stream it cancels, with the same
+topics and data, so an indexer handles single and batch cancellations
+identically.
 
 | | |
 |---|---|
