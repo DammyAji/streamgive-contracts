@@ -213,6 +213,15 @@ pub struct UpgradedEvent {
     pub new_wasm_hash: BytesN<32>,
 }
 
+/// Emitted by `execute_upgrade` with the full configuration in force as the
+/// upgraded code takes over (issue #443). New code may introduce settings that
+/// take their defaults silently; this gives indexers an explicit baseline
+/// for the new contract version instead of leaving them to infer it.
+#[contractevent(topics = ["config_snapshot"], data_format = "single-value")]
+pub struct ConfigSnapshotEvent {
+    pub config: Config,
+}
+
 #[contractevent(topics = ["uppropose"], data_format = "single-value")]
 pub struct UpgradeProposedEvent {
     #[topic]
@@ -3884,7 +3893,8 @@ impl DonationVault {
     }
 
     /// Carries out the upgrade proposed by `propose_upgrade`, replacing the
-    /// contract's Wasm bytecode in place. Admin-gated; emits an `upgrade`
+    /// contract's Wasm bytecode in place. Admin-gated; emits a
+    /// `config_snapshot` of the current configuration followed by an `upgrade`
     /// event. Fails with `NoPendingUpgrade` when nothing is proposed, and with
     /// `UpgradeDelayNotElapsed` before the timelock has elapsed.
     pub fn execute_upgrade(env: Env) -> Result<(), Error> {
@@ -3902,6 +3912,13 @@ impl DonationVault {
         env.deployer()
             .update_current_contract_wasm(pending.new_wasm_hash.clone());
         extend_instance_ttl(&env);
+
+        // The upgraded code starts from this configuration; publish it before
+        // the `upgrade` event so that event remains the call's last one.
+        ConfigSnapshotEvent {
+            config: DonationVault::get_config(env.clone()),
+        }
+        .publish(&env);
 
         UpgradedEvent {
             new_wasm_hash: pending.new_wasm_hash,
