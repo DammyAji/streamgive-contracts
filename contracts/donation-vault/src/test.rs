@@ -4228,7 +4228,7 @@ fn create_stream_cost_stays_flat_as_one_ngo_gains_streams() {
     let s = setup();
     s.client.set_max_streams_per_donor(&STREAM_COUNT);
     s.token_admin
-        .mint(&s.donor, &1_000 * STREAM_COUNT as i128);
+        .mint(&s.donor, &(1_000 * STREAM_COUNT as i128));
 
     let first = s
         .client
