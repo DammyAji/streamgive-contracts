@@ -4222,6 +4222,53 @@ fn streams_by_ngo_tracks_create_and_transfer_with_pagination() {
 }
 
 #[test]
+fn create_stream_cost_stays_flat_as_one_ngo_gains_streams() {
+    const STREAM_COUNT: u64 = 300;
+
+    let s = setup();
+    s.client.set_max_streams_per_donor(&STREAM_COUNT);
+    s.token_admin
+        .mint(&s.donor, &1_000 * STREAM_COUNT as i128);
+
+    let first = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let first_cost = s.env.cost_estimate().resources();
+
+    let mut last = first;
+    let mut last_cost = first_cost.clone();
+    for _ in 1..STREAM_COUNT {
+        last = s
+            .client
+            .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+        last_cost = s.env.cost_estimate().resources();
+    }
+
+    assert_eq!(first, 0);
+    assert_eq!(last, STREAM_COUNT - 1);
+
+    let instruction_limit = first_cost.instructions * 2;
+    assert!(
+        last_cost.instructions <= instruction_limit,
+        "create_stream instructions grew from {} for the first stream to {} after {} streams (limit {})",
+        first_cost.instructions,
+        last_cost.instructions,
+        STREAM_COUNT,
+        instruction_limit,
+    );
+
+    let memory_limit = first_cost.mem_bytes * 2;
+    assert!(
+        last_cost.mem_bytes <= memory_limit,
+        "create_stream memory grew from {} bytes for the first stream to {} bytes after {} streams (limit {})",
+        first_cost.mem_bytes,
+        last_cost.mem_bytes,
+        STREAM_COUNT,
+        memory_limit,
+    );
+}
+
+#[test]
 fn total_donated_overflow_rejects_create_and_top_up() {
     let s = setup();
     s.token_admin.mint(&s.donor, &2_000);
