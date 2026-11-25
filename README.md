@@ -13,7 +13,8 @@ which risks are knowingly accepted, see
 [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
 All of the guides in `docs/`, each with a one-line summary, are listed in
-[docs/README.md](docs/README.md).
+[docs/README.md](docs/README.md). If you are here to give rather than to build,
+start with the plain-language [donor's guide](docs/DONORS.md).
 
 ## Contracts
 
