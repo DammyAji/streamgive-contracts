@@ -22,8 +22,9 @@ layout stable. Event type names include `RegisterEvent`, `RenamedEvent`,
 `MinDepositSetEvent`, `CancelGraceLedgersSetEvent`, `RegistrySetEvent`,
 `PayoutAddressSetEvent`, `MaxStreamsPerDonorSetEvent`, `MaxRateSetEvent`,
 `MaxRateClearedEvent`, `InitializedEvent`,
-`UpgradedEvent`, `UpgradeProposedEvent`, `UpgradeCancelledEvent`,
-`UpgradeDelaySetEvent`, `ApproverAddedEvent`, `ApproverRemovedEvent`,
+`UpgradedEvent`, `ConfigSnapshotEvent`, `UpgradeProposedEvent`,
+`UpgradeCancelledEvent`, `UpgradeDelaySetEvent`, `ApproverAddedEvent`,
+`ApproverRemovedEvent`,
 `MetadataUriSetEvent`, `RenewedEvent`, `VerifyPeriodSetEvent`, `CreatedEvent`,
 `WithdrawnEvent`, `DrainedEvent`, `CancelledStreamEvent`, `RescuedStreamEvent`,
 `ToppedUpEvent`, `RateModifiedEvent`, `TransferStreamEvent`,
@@ -522,6 +523,25 @@ vault's Wasm bytecode.
 configured `upgrade_delay` of zero). With a non-zero delay it returns
 `Error::UpgradeTimelockEnabled`, and the code change happens through
 `execute_upgrade` instead (#343).
+
+### `config_snapshot`
+
+Emitted by `execute_upgrade` just before its `upgrade` event, carrying the
+full configuration in force as the upgraded code takes over. Settings newly
+introduced by an upgrade take their defaults silently; this event gives an
+indexer a known starting point for the new contract version instead of
+leaving it to infer when a value changed (#443).
+
+| | |
+|---|---|
+| Topics | `("config_snapshot",)` |
+| Data | `config: Config` (the same struct returned by `get_config`) |
+
+The payload includes `paused`, `treasury`, `fee_bps`, `min_deposit`,
+`max_streams_per_donor`, `max_rate`, `min_duration`, `registry`,
+`cancel_grace_ledgers`, `total_donated`, `total_withdrawn`,
+`total_fees_collected`, `pending_admin`, and `renounced`. It is published only
+by `execute_upgrade`; the immediate `upgrade` entry point does not emit one.
 
 ### `uppropose`
 

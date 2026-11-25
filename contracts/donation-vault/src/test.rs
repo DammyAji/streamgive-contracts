@@ -4441,6 +4441,47 @@ fn execute_upgrade_after_delay_elapsed_succeeds() {
 }
 
 #[test]
+fn execute_upgrade_emits_config_snapshot_of_full_config() {
+    let s = setup();
+    s.env.ledger().with_mut(|l| l.timestamp = 1_000);
+    s.client.set_upgrade_delay(&3_600);
+
+    // Give the snapshot non-default values to prove it carries the whole
+    // Config rather than just a handful of fields.
+    let treasury = Address::generate(&s.env);
+    let registry = Address::generate(&s.env);
+    let candidate = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500);
+    s.client.set_min_deposit(&100);
+    s.client.set_max_streams_per_donor(&50);
+    s.client.set_max_rate(&1_000);
+    s.client.set_min_duration(&60);
+    s.client.set_cancel_grace_ledgers(&10);
+    s.client.set_registry(&registry);
+    s.client.propose_admin(&candidate);
+    s.client.pause();
+
+    // Read before executing: any top-level call clears the event buffer.
+    let config_before = s.client.get_config();
+
+    let new_wasm_hash = s.env.deployer().upload_contract_wasm(Bytes::new(&s.env));
+    s.client.propose_upgrade(&new_wasm_hash);
+    s.env.ledger().with_mut(|l| l.timestamp = 4_600);
+    s.client.execute_upgrade();
+
+    // The snapshot precedes `upgrade`, which stays the call's last event.
+    assert_nth_last_event(
+        &s.env,
+        1,
+        (Symbol::new(&s.env, "config_snapshot"),),
+        config_before.clone(),
+    );
+    assert_last_event(&s.env, (symbol_short!("upgrade"),), new_wasm_hash);
+    assert_eq!(s.client.get_config(), config_before);
+}
+
+#[test]
 fn execute_upgrade_without_proposal_fails() {
     let s = setup();
 
