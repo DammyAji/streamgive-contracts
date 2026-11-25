@@ -2271,6 +2271,40 @@ fn streams_by_donor_is_per_donor() {
 }
 
 #[test]
+fn donor_stream_count_is_zero_before_any_stream() {
+    let s = setup();
+    assert_eq!(s.client.donor_stream_count(&s.donor), 0);
+}
+
+#[test]
+fn donor_stream_count_tracks_multiple_streams() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &3_000);
+
+    s.client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &20);
+    s.client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &30);
+
+    assert_eq!(s.client.donor_stream_count(&s.donor), 3);
+}
+
+#[test]
+fn donor_stream_count_keeps_cancelled_stream() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.cancel_stream(&stream_id);
+
+    assert_eq!(s.client.donor_stream_count(&s.donor), 1);
+}
+
+#[test]
 fn stream_ids_are_sequential_and_stream_count_tracks_them() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000_000);

@@ -1554,6 +1554,19 @@ impl DonationVault {
         ids
     }
 
+    /// Returns the per-donor stream counter used to enforce the stream cap.
+    ///
+    /// This is the same counter checked by `create_stream`. It is incremented
+    /// when a stream is created and never decremented, so cancelled streams
+    /// still count toward the donor's limit. Returns `0` for donors that have
+    /// never created a stream.
+    pub fn donor_stream_count(env: Env, donor: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DonorStreamCount(donor))
+            .unwrap_or(0)
+    }
+
     /// Lists stream ids associated with an NGO in creation order.
     /// Results are bounded by `limit`, which is clamped to `MAX_STREAMS_BY_NGO`.
     pub fn streams_by_ngo(env: Env, ngo: Address, start: u32, limit: u32) -> Vec<u64> {
