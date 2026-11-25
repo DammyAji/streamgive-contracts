@@ -4215,6 +4215,82 @@ fn pause_resume_top_up_cancel_and_outflow_totals() {
 }
 
 #[test]
+fn resume_stream_after_ngo_revoked_fails_with_ngo_not_verified() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Advance time so accrual happens, then pause the stream.
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    s.client.pause_stream(&stream_id);
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Paused);
+
+    // Revoke the NGO while the stream is paused.
+    registry.revoke_ngo(&s.client.admin(), &s.ngo);
+
+    // Resume must be rejected — the donor cannot restart payments to a
+    // revoked NGO by resuming a stream that was paused before revocation.
+    let result = s.client.try_resume_stream(&stream_id);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    // The stream is still paused and its state is unchanged.
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.status, StreamStatus::Paused);
+}
+
+#[test]
+fn resume_stream_after_ngo_re_approved_succeeds() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    s.client.pause_stream(&stream_id);
+
+    // Revoke, confirm resume is blocked.
+    registry.revoke_ngo(&s.client.admin(), &s.ngo);
+    assert_eq!(
+        s.client.try_resume_stream(&stream_id),
+        Err(Ok(Error::NgoNotVerified))
+    );
+
+    // Re-approve the NGO — resume should now succeed.
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
+    assert_eq!(s.client.try_resume_stream(&stream_id), Ok(Ok(())));
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Active);
+}
+
+#[test]
+fn resume_stream_without_registry_configured_always_succeeds() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    s.client.pause_stream(&stream_id);
+
+    // No registry is configured, so the NGO check is skipped entirely.
+    assert_eq!(s.client.registry(), None);
+    assert_eq!(s.client.try_resume_stream(&stream_id), Ok(Ok(())));
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Active);
+}
+
+#[test]
 fn streams_by_ngo_tracks_create_and_transfer_with_pagination() {
     let s = setup();
     s.token_admin.mint(&s.donor, &2_000);

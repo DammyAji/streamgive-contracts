@@ -2957,6 +2957,11 @@ impl DonationVault {
             return Err(Error::StreamNotPaused);
         }
 
+        // Re-check that the NGO is still verified before resuming accrual.
+        // A donor must not be able to restart payments to an NGO whose
+        // verification was revoked while the stream was paused.
+        require_verified_ngo(&env, &stream.ngo)?;
+
         stream.status = StreamStatus::Active;
         stream.last_update = env.ledger().timestamp();
         env.storage().persistent().set(&key, &stream);
