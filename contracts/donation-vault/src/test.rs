@@ -4210,6 +4210,103 @@ fn streams_by_ngo_tracks_create_and_transfer_with_pagination() {
     );
 }
 
+fn create_streams_for_ngo(s: &Setup<'_>, count: u32) -> Vec<u64> {
+    s.client.set_max_streams_per_donor(&(count as u64));
+    s.token_admin.mint(&s.donor, &(count as i128 * 1_000));
+    let mut ids = Vec::new(&s.env);
+    for _ in 0..count {
+        let id = s
+            .client
+            .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+        ids.push_back(id);
+    }
+    ids
+}
+
+#[test]
+fn streams_by_ngo_pages_follow_the_compacted_index_after_transfers() {
+    let s = setup();
+    let other_ngo = Address::generate(&s.env);
+    let count = MAX_STREAMS_BY_NGO + 3;
+    let ids = create_streams_for_ngo(&s, count);
+
+    assert_eq!(
+        s.client.streams_by_ngo(&s.ngo, &0, &MAX_STREAMS_BY_NGO),
+        ids.slice(0..MAX_STREAMS_BY_NGO)
+    );
+    assert_eq!(
+        s.client
+            .streams_by_ngo(&s.ngo, &MAX_STREAMS_BY_NGO, &MAX_STREAMS_BY_NGO),
+        ids.slice(MAX_STREAMS_BY_NGO..count)
+    );
+
+    s.client.transfer_stream(&ids.get(2).unwrap(), &other_ngo);
+    s.client
+        .transfer_stream(&ids.get(MAX_STREAMS_BY_NGO + 1).unwrap(), &other_ngo);
+
+    let mut expected_first = Vec::new(&s.env);
+    expected_first.append(&ids.slice(0..2));
+    expected_first.append(&ids.slice(3..=MAX_STREAMS_BY_NGO));
+    let start = 0u32;
+    let page = s.client.streams_by_ngo(&s.ngo, &start, &MAX_STREAMS_BY_NGO);
+    assert_eq!(page, expected_first);
+
+    let next = start + page.len();
+    assert_eq!(next, MAX_STREAMS_BY_NGO);
+    let tail = s.client.streams_by_ngo(&s.ngo, &next, &MAX_STREAMS_BY_NGO);
+    assert_eq!(tail, ids.slice(count - 1..count));
+    assert!(s
+        .client
+        .streams_by_ngo(&s.ngo, &(next + tail.len()), &MAX_STREAMS_BY_NGO)
+        .is_empty());
+
+    let cursor = s
+        .client
+        .withdraw_all(&s.ngo, &next, &MAX_BATCH_WITHDRAW_STREAMS);
+    assert_eq!(cursor.amounts.len(), tail.len());
+    assert_eq!(cursor.next, next + tail.len());
+
+    assert_eq!(
+        s.client
+            .streams_by_ngo(&other_ngo, &0, &MAX_STREAMS_BY_NGO),
+        Vec::from_array(&s.env, [ids.get(2).unwrap(), ids.get(MAX_STREAMS_BY_NGO + 1).unwrap()])
+    );
+}
+
+#[test]
+fn streams_by_ngo_pages_keep_cancelled_ids_and_next_position() {
+    let s = setup();
+    let count = MAX_STREAMS_BY_NGO + 3;
+    let ids = create_streams_for_ngo(&s, count);
+
+    let cancelled_first = ids.get(0).unwrap();
+    let cancelled_second = ids.get(MAX_STREAMS_BY_NGO + 1).unwrap();
+    s.client.cancel_stream(&cancelled_first);
+    s.client.cancel_stream(&cancelled_second);
+    assert!(s.client.get_stream(&cancelled_first).cancelled);
+    assert!(s.client.get_stream(&cancelled_second).cancelled);
+
+    let start = 0u32;
+    let page = s.client.streams_by_ngo(&s.ngo, &start, &MAX_STREAMS_BY_NGO);
+    assert_eq!(page, ids.slice(0..MAX_STREAMS_BY_NGO));
+    let next = start + page.len();
+    assert_eq!(next, MAX_STREAMS_BY_NGO);
+
+    let tail = s.client.streams_by_ngo(&s.ngo, &next, &MAX_STREAMS_BY_NGO);
+    assert_eq!(tail, ids.slice(MAX_STREAMS_BY_NGO..count));
+    assert!(s
+        .client
+        .streams_by_ngo(&s.ngo, &(next + tail.len()), &MAX_STREAMS_BY_NGO)
+        .is_empty());
+
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    let cursor = s
+        .client
+        .withdraw_all(&s.ngo, &next, &MAX_BATCH_WITHDRAW_STREAMS);
+    assert_eq!(cursor.amounts, Vec::from_array(&s.env, [100i128, 0, 100]));
+    assert_eq!(cursor.next, count);
+}
+
 #[test]
 fn total_donated_overflow_rejects_create_and_top_up() {
     let s = setup();
