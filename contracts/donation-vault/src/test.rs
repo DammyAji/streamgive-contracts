@@ -2268,6 +2268,40 @@ fn streams_by_donor_is_per_donor() {
 }
 
 #[test]
+fn donor_stream_count_is_zero_before_any_stream() {
+    let s = setup();
+    assert_eq!(s.client.donor_stream_count(&s.donor), 0);
+}
+
+#[test]
+fn donor_stream_count_tracks_multiple_streams() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &3_000);
+
+    s.client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &20);
+    s.client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &30);
+
+    assert_eq!(s.client.donor_stream_count(&s.donor), 3);
+}
+
+#[test]
+fn donor_stream_count_keeps_cancelled_stream() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.cancel_stream(&stream_id);
+
+    assert_eq!(s.client.donor_stream_count(&s.donor), 1);
+}
+
+#[test]
 fn stream_ids_are_sequential_and_stream_count_tracks_them() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000_000);
@@ -4181,6 +4215,82 @@ fn pause_resume_top_up_cancel_and_outflow_totals() {
 }
 
 #[test]
+fn resume_stream_after_ngo_revoked_fails_with_ngo_not_verified() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Advance time so accrual happens, then pause the stream.
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    s.client.pause_stream(&stream_id);
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Paused);
+
+    // Revoke the NGO while the stream is paused.
+    registry.revoke_ngo(&s.client.admin(), &s.ngo);
+
+    // Resume must be rejected — the donor cannot restart payments to a
+    // revoked NGO by resuming a stream that was paused before revocation.
+    let result = s.client.try_resume_stream(&stream_id);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    // The stream is still paused and its state is unchanged.
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.status, StreamStatus::Paused);
+}
+
+#[test]
+fn resume_stream_after_ngo_re_approved_succeeds() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    s.client.pause_stream(&stream_id);
+
+    // Revoke, confirm resume is blocked.
+    registry.revoke_ngo(&s.client.admin(), &s.ngo);
+    assert_eq!(
+        s.client.try_resume_stream(&stream_id),
+        Err(Ok(Error::NgoNotVerified))
+    );
+
+    // Re-approve the NGO — resume should now succeed.
+    registry.approve_ngo(&s.client.admin(), &s.ngo);
+    assert_eq!(s.client.try_resume_stream(&stream_id), Ok(Ok(())));
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Active);
+}
+
+#[test]
+fn resume_stream_without_registry_configured_always_succeeds() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    s.client.pause_stream(&stream_id);
+
+    // No registry is configured, so the NGO check is skipped entirely.
+    assert_eq!(s.client.registry(), None);
+    assert_eq!(s.client.try_resume_stream(&stream_id), Ok(Ok(())));
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Active);
+}
+
+#[test]
 fn streams_by_ngo_tracks_create_and_transfer_with_pagination() {
     let s = setup();
     s.token_admin.mint(&s.donor, &2_000);
@@ -4305,6 +4415,53 @@ fn streams_by_ngo_pages_keep_cancelled_ids_and_next_position() {
         .withdraw_all(&s.ngo, &next, &MAX_BATCH_WITHDRAW_STREAMS);
     assert_eq!(cursor.amounts, Vec::from_array(&s.env, [100i128, 0, 100]));
     assert_eq!(cursor.next, count);
+}
+
+#[test]
+fn create_stream_cost_stays_flat_as_one_ngo_gains_streams() {
+    const STREAM_COUNT: u64 = 300;
+
+    let s = setup();
+    s.client.set_max_streams_per_donor(&STREAM_COUNT);
+    s.token_admin
+        .mint(&s.donor, &(1_000 * STREAM_COUNT as i128));
+
+    let first = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let first_cost = s.env.cost_estimate().resources();
+
+    let mut last = first;
+    let mut last_cost = first_cost.clone();
+    for _ in 1..STREAM_COUNT {
+        last = s
+            .client
+            .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+        last_cost = s.env.cost_estimate().resources();
+    }
+
+    assert_eq!(first, 0);
+    assert_eq!(last, STREAM_COUNT - 1);
+
+    let instruction_limit = first_cost.instructions * 2;
+    assert!(
+        last_cost.instructions <= instruction_limit,
+        "create_stream instructions grew from {} for the first stream to {} after {} streams (limit {})",
+        first_cost.instructions,
+        last_cost.instructions,
+        STREAM_COUNT,
+        instruction_limit,
+    );
+
+    let memory_limit = first_cost.mem_bytes * 2;
+    assert!(
+        last_cost.mem_bytes <= memory_limit,
+        "create_stream memory grew from {} bytes for the first stream to {} bytes after {} streams (limit {})",
+        first_cost.mem_bytes,
+        last_cost.mem_bytes,
+        STREAM_COUNT,
+        memory_limit,
+    );
 }
 
 #[test]
