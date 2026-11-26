@@ -323,7 +323,7 @@ impl DonationVault {
         if start >= ngo_streams.len() {
             return ids;
         }
-        let end = (start as u32).saturating_add(capped).min(ngo_streams.len());
+        let end = start.saturating_add(capped).min(ngo_streams.len());
         for i in start..end {
             if let Some(id) = ngo_streams.get(i) {
                 ids.push_back(id);
@@ -735,6 +735,11 @@ impl DonationVault {
             return Err(Error::StreamNotPaused);
         }
 
+        // Re-check that the NGO is still verified before resuming accrual.
+        // A donor must not be able to restart payments to an NGO whose
+        // verification was revoked while the stream was paused.
+        require_verified_ngo(&env, &stream.ngo)?;
+
         stream.status = StreamStatus::Active;
         stream.last_update = env.ledger().timestamp();
         env.storage().persistent().set(&key, &stream);
@@ -971,7 +976,7 @@ impl DonationVault {
 
     pub fn cancel_stream(env: Env, stream_id: u64) -> Result<i128, Error> {
         let key = DataKey::Stream(stream_id);
-        let mut stream: Stream = env
+        let stream: Stream = env
             .storage()
             .persistent()
             .get(&key)
@@ -1007,7 +1012,66 @@ impl DonationVault {
             CancelledStreamEvent { stream_id, accrued, refund }.publish(&env);
         }
 
-        Ok(refund)
+        // An empty batch is a no-op rather than an error: there is nothing to
+        // cancel and nothing to refund, so no auth is needed either.
+        if stream_ids.is_empty() {
+            return Ok(Vec::new(&env));
+        }
+
+        // First pass: validate the whole batch before anything moves, so an
+        // unknown, already-cancelled, or foreign stream aborts the call with
+        // no partial cancellation. All ids must share one donor, which
+        // authorizes the batch once.
+        let mut donor: Option<Address> = None;
+        let mut streams: Vec<Stream> = Vec::new(&env);
+        for stream_id in stream_ids.iter() {
+            let stream: Stream = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Stream(stream_id))
+                .ok_or(Error::StreamNotFound)?;
+
+            match &donor {
+                None => donor = Some(stream.donor.clone()),
+                Some(existing) if existing != &stream.donor => return Err(Error::NotStreamOwner),
+                Some(_) => {}
+            }
+
+            if stream.cancelled {
+                return Err(Error::StreamCancelled);
+            }
+
+            streams.push_back(stream);
+        }
+
+        let donor = donor.ok_or(Error::StreamNotFound)?;
+        donor.require_auth();
+
+        let now = env.ledger().timestamp();
+        let grace_ledgers = env
+            .storage()
+            .instance()
+            .get(&DataKey::CancelGraceLedgers)
+            .unwrap_or(0);
+
+        // Second pass: settle and refund each stream. Any failure here (an
+        // arithmetic overflow, a failed token transfer) aborts the whole
+        // transaction, so the batch still cannot leave a half-cancelled set.
+        let mut refunds: Vec<i128> = Vec::new(&env);
+        for (idx, stream_id) in stream_ids.iter().enumerate() {
+            let stream = streams.get(idx as u32).ok_or(Error::StreamNotFound)?;
+            refunds.push_back(cancel_stream_inner(
+                &env,
+                stream_id,
+                stream,
+                now,
+                grace_ledgers,
+            )?);
+        }
+
+        extend_instance_ttl(&env);
+
+        Ok(refunds)
     }
 
     pub fn rescue_stream(env: Env, stream_id: u64) -> Result<i128, Error> {
